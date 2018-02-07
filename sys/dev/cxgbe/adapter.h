@@ -118,7 +118,9 @@ enum {
 	SGE_MAX_WR_NDESC = SGE_MAX_WR_LEN / EQ_ESIZE, /* max WR size in desc */
 	TX_SGL_SEGS = 39,
 	TX_SGL_SEGS_TSO = 38,
-	TX_WR_FLITS = SGE_MAX_WR_LEN / 8
+	TX_WR_FLITS = SGE_MAX_WR_LEN / 8,
+
+	TX_MAX_PKT_SEGS = 128
 };
 
 enum {
@@ -543,6 +545,9 @@ struct sge_txq {
 	struct mp_ring *r;	/* tx software ring */
 	struct tx_sdesc *sdesc;	/* KVA of software descriptor ring */
 	struct sglist *gl;
+	uint16_t *pkt_lens;
+	uint8_t *pkt_cnts;
+	uint8_t *pkt_offs;
 	__be32 cpl_ctrl0;	/* for convenience */
 	int tc_idx;		/* traffic class */
 
@@ -840,6 +845,8 @@ struct adapter {
 	uint16_t cryptocaps;
 	uint16_t iscsicaps;
 	uint16_t fcoecaps;
+
+	uint16_t vxlan_port;
 
 	struct sysctl_ctx_list ctx; /* from adapter_full_init to full_uninit */
 

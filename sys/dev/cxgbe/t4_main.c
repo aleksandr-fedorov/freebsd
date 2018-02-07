@@ -216,6 +216,8 @@ static driver_t vcc_driver = {
 static void cxgbe_init(void *);
 static int cxgbe_ioctl(struct ifnet *, unsigned long, caddr_t);
 static int cxgbe_transmit(struct ifnet *, struct mbuf *);
+static int cxgbe_mbuf_to_qid(struct ifnet *, struct mbuf *);
+static int cxgbe_transmit_txq(struct ifnet *, struct mbuf *);
 static void cxgbe_qflush(struct ifnet *);
 static int cxgbe_media_change(struct ifnet *);
 static void cxgbe_media_status(struct ifnet *, struct ifmediareq *);
@@ -1433,7 +1435,7 @@ cxgbe_probe(device_t dev)
 
 #define T4_CAP (IFCAP_VLAN_HWTAGGING | IFCAP_VLAN_MTU | IFCAP_HWCSUM | \
     IFCAP_VLAN_HWCSUM | IFCAP_TSO | IFCAP_JUMBO_MTU | IFCAP_LRO | \
-    IFCAP_VLAN_HWTSO | IFCAP_LINKSTATE | IFCAP_HWCSUM_IPV6 | IFCAP_HWSTATS)
+	IFCAP_VLAN_HWTSO | IFCAP_LINKSTATE | IFCAP_HWCSUM_IPV6 | IFCAP_HWSTATS)
 #define T4_CAP_ENABLE (T4_CAP)
 
 static int
@@ -1460,10 +1462,12 @@ cxgbe_vi_attach(device_t dev, struct vi_info *vi)
 	ifp->if_init = cxgbe_init;
 	ifp->if_ioctl = cxgbe_ioctl;
 	ifp->if_transmit = cxgbe_transmit;
+	ifp->if_transmit_txq = cxgbe_transmit_txq;
+	ifp->if_mbuf_to_qid = cxgbe_mbuf_to_qid;
 	ifp->if_qflush = cxgbe_qflush;
 	ifp->if_get_counter = cxgbe_get_counter;
 
-	ifp->if_capabilities = T4_CAP;
+	ifp->if_capabilities = T4_CAP | IFCAP_VXLANDECAP;
 #ifdef TCP_OFFLOAD
 	if (vi->nofldrxq != 0)
 		ifp->if_capabilities |= IFCAP_TOE;
@@ -1818,12 +1822,55 @@ fail:
 			rc = copyout(&i2c, ifr->ifr_data, sizeof(i2c));
 		break;
 	}
-
+#ifdef notyet
+	case SIOCSIFVXLANPORT:
+		rc = begin_synchronized_op(sc, vi, SLEEP_OK | INTR_OK, "t4cap");
+		ifp->if_capenable |= IFCAP_VXLANDECAP;
+		sc->vxlan_port = ifr->ifr_index;
+		end_synchronized_op(sc, 0);
+		break;
+#endif
 	default:
 		rc = ether_ioctl(ifp, cmd, data);
 	}
 
 	return (rc);
+}
+
+static int
+cxgbe_transmit_txq(struct ifnet *ifp, struct mbuf *m)
+{
+	struct mbuf *mp, *mnext;
+	int rc, lasterr;
+
+	mp = m;
+	lasterr = 0;
+	do {
+		mnext = mp->m_nextpkt;
+		mp->m_nextpkt = NULL;
+		rc = cxgbe_transmit(ifp, mp);
+		if (__predict_false(rc)) {
+			lasterr = rc;
+			if (rc == ENOBUFS) {
+				m_freechain(mnext);
+				return (rc);
+			}
+		}
+		mp = mnext;
+	} while (mp != NULL);
+	return (lasterr);
+}
+
+static int
+cxgbe_mbuf_to_qid(struct ifnet *ifp, struct mbuf *m)
+{
+	struct vi_info *vi = ifp->if_softc;
+
+	if (M_HASHTYPE_GET(m) != M_HASHTYPE_NONE)
+		return ((m->m_pkthdr.flowid % (vi->ntxq - vi->rsrv_noflowq)) +
+		    vi->rsrv_noflowq);
+
+	return (0);
 }
 
 static int

@@ -50,6 +50,8 @@ __FBSDID("$FreeBSD$");
 #include <net/bpf.h>
 #include <net/ethernet.h>
 #include <net/if.h>
+#include <net/if_var.h>
+#include <net/iflib.h>
 #include <net/if_vlan_var.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
@@ -251,14 +253,14 @@ static inline u_int txpkt_vm_len16(u_int, u_int);
 static inline u_int txpkts0_len16(u_int);
 static inline u_int txpkts1_len16(void);
 static u_int write_txpkt_wr(struct sge_txq *, struct fw_eth_tx_pkt_wr *,
-    struct mbuf *, u_int);
+    struct mbuf *, u_int, int);
 static u_int write_txpkt_vm_wr(struct adapter *, struct sge_txq *,
     struct fw_eth_tx_pkt_vm_wr *, struct mbuf *, u_int);
 static int try_txpkts(struct mbuf *, struct mbuf *, struct txpkts *, u_int);
 static int add_to_txpkts(struct mbuf *, struct txpkts *, u_int);
 static u_int write_txpkts_wr(struct sge_txq *, struct fw_eth_tx_pkts_wr *,
     struct mbuf *, const struct txpkts *, u_int);
-static void write_gl_to_txd(struct sge_txq *, struct mbuf *, caddr_t *, int);
+static void write_gl_to_txd(struct sge_txq *, struct mbuf *, caddr_t *, int, int);
 static inline void copy_to_txd(struct sge_eq *, caddr_t, caddr_t *, int);
 static inline void ring_eq_db(struct adapter *, struct sge_eq *, u_int);
 static inline uint16_t read_hw_cidx(struct sge_eq *);
@@ -274,7 +276,8 @@ static int handle_fw_msg(struct sge_iq *, const struct rss_header *,
 static int t4_handle_wrerr_rpl(struct adapter *, const __be64 *);
 static void wrq_tx_drain(void *, int);
 static void drain_wrq_wr_list(struct adapter *, struct sge_wrq *);
-
+static void *mvec_advance(const struct mbuf *m, struct mvec_cursor *mc, int offset);
+static void *m_advance(struct mbuf **pm, int *poffset, int len);
 static int sysctl_uint16(SYSCTL_HANDLER_ARGS);
 static int sysctl_bufsizes(SYSCTL_HANDLER_ARGS);
 static int sysctl_tc(SYSCTL_HANDLER_ARGS);
@@ -1516,6 +1519,174 @@ process_iql:
 	return (0);
 }
 
+struct tso_pkt_info {
+	uint8_t tpi_l2_len;
+	uint8_t tpi_l3_len;
+	uint8_t tpi_l4_len;
+	uint8_t tpi_v6:1;
+	uint8_t tpi_proto:7;
+};
+
+static inline int
+parse_encap_pkt(struct mbuf *m0, struct tso_pkt_info *tpi)
+{
+	struct ether_vlan_header *evh;
+	struct tcphdr *th;
+	struct mvec_cursor mc;
+	struct mbuf *m;
+	int eh_type, offset, ipproto;
+	int l2len, l3len;
+	void *l3hdr;
+
+	MPASS(m_ismvec(m0));
+	MPASS(m0->m_pkthdr.encaplen);
+
+	offset = mc.mc_idx = mc.mc_off = 0;
+	m = m0;
+	if (__predict_true(m_ismvec(m)))
+		evh = mvec_advance(m, &mc, m0->m_pkthdr.encaplen);
+	else
+		evh = m_advance(&m, &offset, m0->m_pkthdr.encaplen);
+
+	eh_type = ntohs(evh->evl_encap_proto);
+	if (eh_type == ETHERTYPE_VLAN) {
+		eh_type = ntohs(evh->evl_proto);
+		l2len = sizeof(*evh);
+	} else
+		l2len = ETHER_HDR_LEN;
+
+	if (__predict_true(m_ismvec(m)))
+		l3hdr = mvec_advance(m, &mc, l2len);
+	else
+		l3hdr = m_advance(&m, &offset, l2len);
+
+	switch(eh_type) {
+#ifdef INET6
+	case ETHERTYPE_IPV6:
+	{
+		struct ip6_hdr *ip6 = l3hdr;
+
+		l3len = sizeof(*ip6);
+		ipproto = ip6->ip6_nxt;
+		tpi->tpi_v6 = 1;
+		break;
+	}
+#endif
+#ifdef INET
+	case ETHERTYPE_IP:
+	{
+		struct ip *ip = l3hdr;
+
+		l3len = ip->ip_hl << 2;
+		ipproto = ip->ip_p;
+		tpi->tpi_v6 = 0;
+		break;
+	}
+#endif
+	default:
+		panic("%s: ethertype 0x%04x unknown.  if_cxgbe must be compiled"
+		    " with the same INET/INET6 options as the kernel.",
+		    __func__, eh_type);
+	}
+	tpi->tpi_proto = ipproto;
+	tpi->tpi_l2_len = l2len;
+	tpi->tpi_l3_len = l3len;
+
+	if (ipproto != IPPROTO_TCP)
+		return (0);
+	else if (__predict_true(m_ismvec(m)))
+		th = mvec_advance(m, &mc, l3len);
+	else
+		th = m_advance(&m, &offset, l3len);
+	tpi->tpi_l4_len = th->th_off << 2;
+	MPASS(l2len && l3len && tpi->tpi_l4_len);
+	return (1);
+}
+
+static inline uint64_t
+t6_fill_tnl_lso(struct mbuf *m0, struct cpl_tx_tnl_lso *tnl_lso,
+		enum cpl_tx_tnl_lso_type tnl_type)
+{
+	u32 val;
+	int in_eth_xtra_len, eh_type, rc, csum_type;
+	int l3hdr_len = m0->m_pkthdr.l3hlen;
+	int eth_xtra_len = m0->m_pkthdr.l2hlen - ETHER_HDR_LEN;
+	struct ether_vlan_header *evh;
+	struct tso_pkt_info tpi;
+	uint64_t ctrl1;
+	bool v6;
+
+	MPASS(!(m_ismvec(m0) && MBUF2MH(m0)->mh_multipkt));
+	/*
+	 * Parse encapped headers
+	 */
+	bzero(&tpi, sizeof(tpi));
+	rc = parse_encap_pkt(m0, &tpi);
+	MPASS(rc);
+
+	evh = mtod(m0, struct ether_vlan_header *);
+	if (eth_xtra_len)
+		eh_type = ntohs(evh->evl_proto);
+	else
+		eh_type = ntohs(evh->evl_encap_proto);
+	v6 = (eh_type == ETHERTYPE_IPV6);
+
+	val = V_CPL_TX_TNL_LSO_OPCODE(CPL_TX_TNL_LSO) |
+	      F_CPL_TX_TNL_LSO_FIRST |
+	      F_CPL_TX_TNL_LSO_LAST |
+	      (v6 ? F_CPL_TX_TNL_LSO_IPV6OUT : 0) |
+	      V_CPL_TX_TNL_LSO_ETHHDRLENOUT(eth_xtra_len / 4) |
+	      V_CPL_TX_TNL_LSO_IPHDRLENOUT(l3hdr_len / 4) |
+	      (v6 ? 0 : F_CPL_TX_TNL_LSO_IPHDRCHKOUT) |
+	      F_CPL_TX_TNL_LSO_IPLENSETOUT |
+	      (v6 ? 0 : F_CPL_TX_TNL_LSO_IPIDINCOUT);
+	tnl_lso->op_to_IpIdSplitOut = htonl(val);
+
+	tnl_lso->IpIdOffsetOut = 0;
+
+	/* Get the tunnel header length */
+	//val = skb_inner_mac_header(skb) - skb_mac_header(skb);
+	val = m0->m_pkthdr.encaplen;
+	in_eth_xtra_len = tpi.tpi_l2_len - ETHER_HDR_LEN;
+
+	switch (tnl_type) {
+	case TX_TNL_TYPE_VXLAN:
+	case TX_TNL_TYPE_GENEVE:
+		tnl_lso->UdpLenSetOut_to_TnlHdrLen =
+			htons(F_CPL_TX_TNL_LSO_UDPCHKCLROUT |
+			F_CPL_TX_TNL_LSO_UDPLENSETOUT);
+		break;
+	case TX_TNL_TYPE_NVGRE:
+	default:
+		tnl_lso->UdpLenSetOut_to_TnlHdrLen = 0;
+		break;
+	}
+
+	tnl_lso->UdpLenSetOut_to_TnlHdrLen |=
+		 htons(V_CPL_TX_TNL_LSO_TNLHDRLEN(val) |
+		       V_CPL_TX_TNL_LSO_TNLTYPE(tnl_type));
+
+	tnl_lso->r1 = 0;
+
+	val = V_CPL_TX_TNL_LSO_ETHHDRLEN(in_eth_xtra_len / 4) |
+	      V_CPL_TX_TNL_LSO_IPV6(tpi.tpi_v6) |
+	      V_CPL_TX_TNL_LSO_IPHDRLEN(tpi.tpi_l3_len/4) |
+		V_CPL_TX_TNL_LSO_TCPHDRLEN(tpi.tpi_l4_len/4);
+	tnl_lso->Flow_to_TcpHdrLen = htonl(val);
+
+	tnl_lso->IpIdOffset = htons(0);
+
+	tnl_lso->IpIdSplit_to_Mss = htons(V_CPL_TX_TNL_LSO_MSS(m0->m_pkthdr.tso_segsz));
+	tnl_lso->TCPSeqOffset = htonl(0);
+	tnl_lso->EthLenOffset_Size = htonl(V_CPL_TX_TNL_LSO_SIZE(m0->m_pkthdr.len));
+
+	csum_type = tpi.tpi_v6 ? TX_CSUM_TCPIP6 : TX_CSUM_TCPIP;
+	ctrl1 = V_TXPKT_CSUM_TYPE(csum_type);
+	ctrl1 |= V_T6_TXPKT_ETHHDR_LEN(tpi.tpi_l2_len - ETHER_HDR_LEN);
+	ctrl1 |= V_TXPKT_IPHDR_LEN(tpi.tpi_l3_len);
+	return (ctrl1);
+}
+
 static inline int
 cl_has_metadata(struct sge_fl *fl, struct cluster_layout *cll)
 {
@@ -1740,6 +1911,9 @@ t4_eth_rx(struct sge_iq *iq, const struct rss_header *rss, struct mbuf *m0)
 	const struct cpl_rx_pkt *cpl = (const void *)(rss + 1);
 #if defined(INET) || defined(INET6)
 	struct lro_ctrl *lro = &rxq->lro;
+#ifdef notyet
+	int vxlan_decap = ifp->if_capenable & IFCAP_VXLANDECAP;
+#endif
 #endif
 	static const int sw_hashtype[4][2] = {
 		{M_HASHTYPE_NONE, M_HASHTYPE_NONE},
@@ -1785,6 +1959,10 @@ t4_eth_rx(struct sge_iq *iq, const struct rss_header *rss, struct mbuf *m0)
 	}
 
 #if defined(INET) || defined(INET6)
+#ifdef notyet
+	if (vxlan_decap)
+		iflib_vxlan_decap(ifp, m0, sc->vxlan_port, false);
+#endif
 	if (iq->flags & IQ_LRO_ENABLED) {
 		if (sort_before_lro(lro)) {
 			tcp_lro_queue_mbuf(lro, m0);
@@ -1861,8 +2039,7 @@ drain_wrq_wr_list(struct adapter *sc, struct sge_wrq *wrq)
 
 		if (available < eq->sidx / 4 &&
 		    atomic_cmpset_int(&eq->equiq, 0, 1)) {
-			dst->equiq_to_len16 |= htobe32(F_FW_WR_EQUIQ |
-			    F_FW_WR_EQUEQ);
+			dst->equiq_to_len16 |= htobe32(F_FW_WR_EQUIQ | F_FW_WR_EQUEQ);
 			eq->equeqidx = eq->pidx;
 		} else if (IDXDIFF(eq->pidx, eq->equeqidx, eq->sidx) >= 32) {
 			dst->equiq_to_len16 |= htobe32(F_FW_WR_EQUEQ);
@@ -1973,7 +2150,8 @@ mbuf_len16(struct mbuf *m)
 
 	M_ASSERTPKTHDR(m);
 	n = m->m_pkthdr.PH_loc.eight[0];
-	MPASS(n > 0 && n <= SGE_MAX_WR_LEN / 16);
+	if (!(m_ismvec(m) && MBUF2MH(m)->mh_multipkt))
+		MPASS(n > 0 && n <= SGE_MAX_WR_LEN / 16);
 
 	return (n);
 }
@@ -1993,6 +2171,21 @@ needs_tso(struct mbuf *m)
 	M_ASSERTPKTHDR(m);
 
 	if (m->m_pkthdr.csum_flags & CSUM_TSO) {
+		KASSERT(m->m_pkthdr.tso_segsz > 0,
+		    ("%s: TSO requested in mbuf %p but MSS not provided",
+		    __func__, m));
+		return (1);
+	}
+
+	return (0);
+}
+
+static inline int
+needs_vx_tso(struct mbuf *m)
+{
+	M_ASSERTPKTHDR(m);
+
+	if (m->m_pkthdr.csum_flags & CSUM_VX_TSO) {
 		KASSERT(m->m_pkthdr.tso_segsz > 0,
 		    ("%s: TSO requested in mbuf %p but MSS not provided",
 		    __func__, m));
@@ -2047,6 +2240,7 @@ m_advance(struct mbuf **pm, int *poffset, int len)
 	int offset = *poffset;
 	uintptr_t p = 0;
 
+	MPASS(!m_ismvec(m));
 	MPASS(len > 0);
 
 	for (;;) {
@@ -2065,6 +2259,65 @@ m_advance(struct mbuf **pm, int *poffset, int len)
 	return ((void *)p);
 }
 
+static void *
+mvec_advance(const struct mbuf *m, struct mvec_cursor *mc, int offset)
+{
+	const struct mbuf_ext *mext = (const struct mbuf_ext *)m;
+	const struct mvec_ent *me = mext->me_ents;
+	const struct mvec_header *mh = &mext->me_mh;
+	int rem;
+
+	if (offset >= m->m_pkthdr.len)
+		return (NULL);
+	rem = offset;
+
+	me += mh->mh_start + mc->mc_idx ;
+	MPASS(me->me_len);
+	MPASS(me->me_cl);
+	mc->mc_off += offset;
+	while (mc->mc_off >= me->me_len) {
+		mc->mc_off -= me->me_len;
+		mc->mc_idx++;
+		me++;
+	}
+	return (void *)(me_data(me) + mc->mc_off);
+}
+
+
+static inline int
+count_mvec_nsegs(struct mbuf *m)
+{
+	struct mbuf_ext *mext;
+	struct mvec_header *mh;
+	struct mvec_ent *me;
+	vm_paddr_t lastb, next;
+	vm_offset_t va;
+	int i, len, nsegs;
+
+	MPASS(m != NULL);
+
+	mext = (void*)m;
+	mh = &mext->me_mh;
+	me = &mext->me_ents[mh->mh_start];
+
+	nsegs = 0;
+	lastb = 0;
+	for (i = 0; i < mh->mh_used; i++, me++) {
+		len = me->me_len;
+		if (__predict_false(len == 0))
+			continue;
+		va = (vm_offset_t)me_data(me);
+		next = pmap_kextract(va);
+		nsegs += sglist_count(me_data(me), len);
+		if (lastb + 1 == next)
+			nsegs--;
+		lastb = pmap_kextract(va + len - 1);
+	}
+
+	MPASS(nsegs > 0);
+	return (nsegs);
+}
+
 /*
  * Can deal with empty mbufs in the chain that have m_len = 0, but the chain
  * must have at least one mbuf that's not empty.
@@ -2077,6 +2330,8 @@ count_mbuf_nsegs(struct mbuf *m)
 	int len, nsegs;
 
 	MPASS(m != NULL);
+	if (m_ismvec(m))
+		return (count_mvec_nsegs(m));
 
 	nsegs = 0;
 	lastb = 0;
@@ -2108,6 +2363,7 @@ parse_pkt(struct adapter *sc, struct mbuf **mp)
 	struct mbuf *m0 = *mp, *m;
 	int rc, nsegs, defragged = 0, offset;
 	struct ether_header *eh;
+	struct mvec_cursor mc;
 	void *l3hdr;
 #if defined(INET) || defined(INET6)
 	struct tcphdr *tcp;
@@ -2130,7 +2386,10 @@ restart:
 	M_ASSERTPKTHDR(m0);
 	MPASS(m0->m_pkthdr.len > 0);
 	nsegs = count_mbuf_nsegs(m0);
-	if (nsegs > (needs_tso(m0) ? TX_SGL_SEGS_TSO : TX_SGL_SEGS)) {
+	if (m_ismvec(m0) && MBUF2MH(m0)->mh_multipkt) {
+		if (nsegs >= TX_MAX_PKT_SEGS)
+			panic("grow max segs -- limit %d exceeded: %d", TX_MAX_PKT_SEGS, nsegs);
+	} else if (nsegs > (needs_tso(m0) ? TX_SGL_SEGS_TSO : TX_SGL_SEGS)) {
 		if (defragged++ > 0 || (m = m_defrag(m0, M_NOWAIT)) == NULL) {
 			rc = EFBIG;
 			goto fail;
@@ -2155,7 +2414,7 @@ restart:
 	else
 		set_mbuf_len16(m0, txpkt_len16(nsegs, needs_tso(m0)));
 
-	if (!needs_tso(m0) &&
+	if (!needs_tso(m0) && !needs_vx_tso(m0) &&
 	    !(sc->flags & IS_VF && (needs_l3_csum(m0) || needs_l4_csum(m0))))
 		return (0);
 
@@ -2171,7 +2430,10 @@ restart:
 		m0->m_pkthdr.l2hlen = sizeof(*eh);
 
 	offset = 0;
-	l3hdr = m_advance(&m, &offset, m0->m_pkthdr.l2hlen);
+	if (m_ismvec(m))
+		l3hdr = mvec_seek(m, &mc, m0->m_pkthdr.l2hlen);
+	else
+		l3hdr = m_advance(&m, &offset, m0->m_pkthdr.l2hlen);
 
 	switch (eh_type) {
 #ifdef INET6
@@ -2202,7 +2464,10 @@ restart:
 
 #if defined(INET) || defined(INET6)
 	if (needs_tso(m0)) {
-		tcp = m_advance(&m, &offset, m0->m_pkthdr.l3hlen);
+		if (m_ismvec(m))
+			tcp = mvec_seek(m, &mc, m0->m_pkthdr.l2hlen + m0->m_pkthdr.l3hlen);
+		else
+			tcp = m_advance(&m, &offset, m0->m_pkthdr.l3hlen);
 		m0->m_pkthdr.l4hlen = tcp->th_off * 4;
 	}
 #endif
@@ -2345,6 +2610,97 @@ discard_tx(struct sge_eq *eq)
 	return ((eq->flags & (EQ_ENABLED | EQ_QFLUSH)) != EQ_ENABLED);
 }
 
+static inline void
+get_pkt_gl_multi(struct sge_txq *txq, struct mbuf *m, uint8_t *pktcnt)
+{
+	struct sg_multipkt sm;
+	struct sglist *gl;
+	int rc;
+
+	M_ASSERTPKTHDR(m);
+
+	sm.sm_cnts = txq->pkt_cnts;
+	sm.sm_offs = txq->pkt_offs;
+	sm.sm_lens = txq->pkt_lens;
+	sm.sm_pktcnt = pktcnt;
+	gl = txq->gl;
+
+	sglist_reset(gl);
+	rc = sglist_append_mvec_multi(gl, m, &sm);
+	if (__predict_false(rc != 0)) {
+		panic("%s: mbuf %p (%d segs) was vetted earlier but now fails "
+			  "with %d.", __func__, m, mbuf_nsegs(m), rc);
+	}
+
+	MPASS(gl->sg_nseg > 0);
+	KASSERT(gl->sg_nseg == mbuf_nsegs(m),
+			("%s: nsegs changed for mbuf %p from %d to %d", __func__, m,
+			 mbuf_nsegs(m), gl->sg_nseg));
+}
+
+static u_int
+eth_tx_mvec_multi(struct sge_txq *txq, struct mbuf *m0, int remaining, u_int *available, u_int *dbdiff)
+{
+	struct sge_eq *eq = &txq->eq;
+	struct ifnet *ifp = txq->ifp;
+	struct vi_info *vi = ifp->if_softc;
+	struct port_info *pi = vi->pi;
+	struct adapter *sc = pi->adapter;
+	struct fw_eth_tx_pkts_wr *wr;	/* any fw WR struct will do */
+	int i, n, pidx_last, total_desc;
+	uint8_t count;
+
+	get_pkt_gl_multi(txq, m0, &count);
+	MPASS(count);
+#ifdef INVARIANTS
+	for (i = 0; i < count; i++)
+		MPASS(txq->pkt_offs[i] + txq->pkt_cnts[i] < txq->gl->sg_maxseg);
+#endif
+	MPASS(!needs_tso(m0));
+
+	for (total_desc = i = 0; i < count; i++)
+		total_desc += howmany(txpkt_len16(txq->pkt_cnts[i], false), EQ_ESIZE / 16);
+	if (__predict_false(total_desc > *available)) {
+		*available += reclaim_tx_descs(txq, 2*total_desc);
+		if (__predict_false(total_desc > *available)) {
+			/* give the hardware a chance to drain 12kB */
+			DELAY(1);
+			*available += reclaim_tx_descs(txq, 2*total_desc);
+			if (__predict_false(total_desc > *available))
+				return (1);
+
+		}
+	}
+	remaining += count;
+	for (i = 0; i < count; i++, remaining--) {
+		wr = (void *)&eq->desc[eq->pidx];
+		ETHER_BPF_MTAPV(ifp, m0, i);
+		n = write_txpkt_wr(txq, (void *)wr, m0, *available, i);
+
+		*dbdiff += n;
+		*available -= n;
+		pidx_last = eq->pidx;
+		IDXINCR(eq->pidx, n, eq->sidx);
+		if (total_available_tx_desc(eq) < eq->sidx / 4 &&
+			atomic_cmpset_int(&eq->equiq, 0, 1)) {
+			wr->equiq_to_len16 |= htobe32(F_FW_WR_EQUIQ |
+										  F_FW_WR_EQUEQ);
+			eq->equeqidx = eq->pidx;
+		} else if (IDXDIFF(eq->pidx, eq->equeqidx, eq->sidx) >= 32) {
+			wr->equiq_to_len16 |= htobe32(F_FW_WR_EQUEQ);
+			eq->equeqidx = eq->pidx;
+		}
+
+		if (*dbdiff >= 16 && remaining >= 4) {
+			ring_eq_db(sc, eq, *dbdiff);
+			*available += reclaim_tx_descs(txq, 4 * (*dbdiff));
+			*dbdiff = 0;
+		}
+	}
+	txq->sdesc[pidx_last].m = m0;
+	return (0);
+}
+
 /*
  * r->items[cidx] to r->items[pidx], with a wraparound at r->size, are ready to
  * be consumed.  Return the actual number consumed.  0 indicates a stall.
@@ -2412,6 +2768,13 @@ eth_tx(struct mp_ring *r, u_int cidx, u_int pidx)
 			ETHER_BPF_MTAP(ifp, m0);
 			n = write_txpkt_vm_wr(sc, txq, (void *)wr, m0,
 			    available);
+		} else if (m_ismvec(m0) && MBUF2MH(m0)->mh_multipkt) {
+			if (eth_tx_mvec_multi(txq, m0, remaining, &available, &dbdiff))
+				break;
+			total++;
+			remaining--;
+			cidx = next_cidx;
+			continue;
 		} else if (remaining > 1 &&
 		    try_txpkts(m0, r->items[next_cidx], &txp, available) == 0) {
 
@@ -2444,7 +2807,7 @@ eth_tx(struct mp_ring *r, u_int cidx, u_int pidx)
 			total++;
 			remaining--;
 			ETHER_BPF_MTAP(ifp, m0);
-			n = write_txpkt_wr(txq, (void *)wr, m0, available);
+			n = write_txpkt_wr(txq, (void *)wr, m0, available, -1);
 		}
 		MPASS(n >= 1 && n <= available && n <= SGE_MAX_WR_NDESC);
 
@@ -3582,7 +3945,10 @@ alloc_txq(struct vi_info *vi, struct sge_txq *txq, int idx,
 
 	TASK_INIT(&txq->tx_reclaim_task, 0, tx_reclaim, eq);
 	txq->ifp = vi->ifp;
-	txq->gl = sglist_alloc(TX_SGL_SEGS, M_WAITOK);
+	txq->gl = sglist_alloc(TX_MAX_PKT_SEGS, M_WAITOK);
+	txq->pkt_lens = malloc(TX_MAX_PKT_SEGS*sizeof(uint16_t), M_CXGBE, M_WAITOK|M_ZERO);
+	txq->pkt_offs = malloc(TX_MAX_PKT_SEGS, M_CXGBE, M_WAITOK|M_ZERO);
+	txq->pkt_cnts = malloc(TX_MAX_PKT_SEGS, M_CXGBE, M_WAITOK|M_ZERO);
 	if (sc->flags & IS_VF)
 		txq->cpl_ctrl0 = htobe32(V_TXPKT_OPCODE(CPL_TX_PKT_XT) |
 		    V_TXPKT_INTF(pi->tx_chan));
@@ -3684,6 +4050,9 @@ free_txq(struct vi_info *vi, struct sge_txq *txq)
 
 	sglist_free(txq->gl);
 	free(txq->sdesc, M_CXGBE);
+	free(txq->pkt_lens, M_CXGBE);
+	free(txq->pkt_offs, M_CXGBE);
+	free(txq->pkt_cnts, M_CXGBE);
 	mp_ring_free(txq->r);
 
 	bzero(txq, sizeof(*txq));
@@ -3949,6 +4318,20 @@ txpkt_len16(u_int nsegs, u_int tso)
 
 	return (howmany(n, 16));
 }
+static inline u_int
+txpkt_vx_len16(u_int nsegs)
+{
+	u_int n;
+
+	MPASS(nsegs > 0);
+
+	nsegs--; /* first segment is part of ulptx_sgl */
+	n = sizeof(struct fw_eth_tx_pkt_wr) + sizeof(struct cpl_tx_pkt_core) +
+	    sizeof(struct ulptx_sgl) + 8 * ((3 * nsegs) / 2 + (nsegs & 1));
+	n += sizeof(struct cpl_tx_tnl_lso);
+
+	return (howmany(n, 16));
+}
 
 /*
  * len16 for a txpkt_vm WR with a GL.  Includes the firmware work
@@ -4180,9 +4563,9 @@ write_txpkt_vm_wr(struct adapter *sc, struct sge_txq *txq,
 	 */
 	if (dst == (void *)&eq->desc[eq->sidx]) {
 		dst = (void *)&eq->desc[0];
-		write_gl_to_txd(txq, m0, &dst, 0);
+		write_gl_to_txd(txq, m0, &dst, 0, -1);
 	} else
-		write_gl_to_txd(txq, m0, &dst, eq->sidx - ndesc < eq->pidx);
+		write_gl_to_txd(txq, m0, &dst, eq->sidx - ndesc < eq->pidx, -1);
 	txq->sgl_wrs++;
 
 	txq->txpkt_wrs++;
@@ -4194,6 +4577,19 @@ write_txpkt_vm_wr(struct adapter *sc, struct sge_txq *txq,
 	return (ndesc);
 }
 
+static enum cpl_tx_tnl_lso_type
+cxgb_encap_offload_supported(struct mbuf *m)
+{
+	if (m_ismvec(m))
+		MPASS(!MBUF2MH(m)->mh_multipkt);
+	/* XXX totally punt for now */
+	if (m->m_pkthdr.encaplen)
+		return TX_TNL_TYPE_VXLAN;
+	else
+		return TX_TNL_TYPE_OPAQUE;
+}
+
+
 /*
  * Write a txpkt WR for this packet to the hardware descriptors, update the
  * software descriptor, and advance the pidx.  It is guaranteed that enough
@@ -4203,13 +4599,18 @@ write_txpkt_vm_wr(struct adapter *sc, struct sge_txq *txq,
  */
 static u_int
 write_txpkt_wr(struct sge_txq *txq, struct fw_eth_tx_pkt_wr *wr,
-    struct mbuf *m0, u_int available)
+   struct mbuf *m0, u_int available, int pktno)
 {
+	struct ifnet *ifp = txq->ifp;
+	struct vi_info *vi = ifp->if_softc;
+	struct port_info *pi = vi->pi;
+	struct adapter *sc = pi->adapter;
 	struct sge_eq *eq = &txq->eq;
 	struct tx_sdesc *txsd;
 	struct cpl_tx_pkt_core *cpl;
+	enum cpl_tx_tnl_lso_type tnl_type = TX_TNL_TYPE_OPAQUE;
 	uint32_t ctrl;	/* used in many unrelated places */
-	uint64_t ctrl1;
+	uint64_t ctrl0, ctrl1;
 	int len16, ndesc, pktlen, nsegs;
 	caddr_t dst;
 
@@ -4217,13 +4618,26 @@ write_txpkt_wr(struct sge_txq *txq, struct fw_eth_tx_pkt_wr *wr,
 	M_ASSERTPKTHDR(m0);
 	MPASS(available > 0 && available < eq->sidx);
 
-	len16 = mbuf_len16(m0);
-	nsegs = mbuf_nsegs(m0);
-	pktlen = m0->m_pkthdr.len;
+	if (pktno >= 0) {
+		nsegs = txq->pkt_cnts[pktno];
+		len16 = txpkt_len16(nsegs, 0);
+		pktlen = txq->pkt_lens[pktno];
+	} else {
+		len16 = mbuf_len16(m0);
+		nsegs = mbuf_nsegs(m0);
+		pktlen = m0->m_pkthdr.len;
+	}
+	if ((m0->m_pkthdr.csum_flags & CSUM_VX_TSO) &&
+		(chip_id(sc) == CHELSIO_T6))
+		tnl_type = cxgb_encap_offload_supported(m0);
 	ctrl = sizeof(struct cpl_tx_pkt_core);
-	if (needs_tso(m0))
+
+	if (tnl_type) {
+		ctrl += sizeof(struct cpl_tx_tnl_lso);
+		len16 = txpkt_vx_len16(nsegs);
+	} else if (needs_tso(m0)) {
 		ctrl += sizeof(struct cpl_tx_pkt_lso_core);
-	else if (pktlen <= imm_payload(2) && available >= 2) {
+	} else if (pktlen <= imm_payload(2) && available >= 2) {
 		/* Immediate data.  Recalculate len16 and set nsegs to 0. */
 		ctrl += pktlen;
 		len16 = howmany(sizeof(struct fw_eth_tx_pkt_wr) +
@@ -4231,7 +4645,9 @@ write_txpkt_wr(struct sge_txq *txq, struct fw_eth_tx_pkt_wr *wr,
 		nsegs = 0;
 	}
 	ndesc = howmany(len16, EQ_ESIZE / 16);
-	MPASS(ndesc <= available);
+	if (__predict_false(ndesc > available))
+		panic("%s called with too few descriptors, %d available %d needed\n",
+			  __func__, available, ndesc);
 
 	/* Firmware work request header */
 	MPASS(wr == (void *)&eq->desc[eq->pidx]);
@@ -4241,18 +4657,20 @@ write_txpkt_wr(struct sge_txq *txq, struct fw_eth_tx_pkt_wr *wr,
 	ctrl = V_FW_WR_LEN16(len16);
 	wr->equiq_to_len16 = htobe32(ctrl);
 	wr->r3 = 0;
+	ctrl1 = 0;
+	ctrl0 = txq->cpl_ctrl0;
 
 	if (needs_tso(m0)) {
 		struct cpl_tx_pkt_lso_core *lso = (void *)(wr + 1);
 
 		KASSERT(m0->m_pkthdr.l2hlen > 0 && m0->m_pkthdr.l3hlen > 0 &&
-		    m0->m_pkthdr.l4hlen > 0,
-		    ("%s: mbuf %p needs TSO but missing header lengths",
-			__func__, m0));
+				m0->m_pkthdr.l4hlen > 0,
+				("%s: mbuf %p needs TSO but missing header lengths",
+				 __func__, m0));
 
 		ctrl = V_LSO_OPCODE(CPL_TX_PKT_LSO) | F_LSO_FIRST_SLICE |
-		    F_LSO_LAST_SLICE | V_LSO_IPHDR_LEN(m0->m_pkthdr.l3hlen >> 2)
-		    | V_LSO_TCPHDR_LEN(m0->m_pkthdr.l4hlen >> 2);
+			F_LSO_LAST_SLICE | V_LSO_IPHDR_LEN(m0->m_pkthdr.l3hlen >> 2)
+			| V_LSO_TCPHDR_LEN(m0->m_pkthdr.l4hlen >> 2);
 		if (m0->m_pkthdr.l2hlen == sizeof(struct ether_vlan_header))
 			ctrl |= V_LSO_ETHHDR_LEN(1);
 		if (m0->m_pkthdr.l3hlen == sizeof(struct ip6_hdr))
@@ -4263,23 +4681,53 @@ write_txpkt_wr(struct sge_txq *txq, struct fw_eth_tx_pkt_wr *wr,
 		lso->mss = htobe16(m0->m_pkthdr.tso_segsz);
 		lso->seqno_offset = htobe32(0);
 		lso->len = htobe32(pktlen);
-
 		cpl = (void *)(lso + 1);
-
 		txq->tso_wrs++;
+	} else if (tnl_type) {
+		struct cpl_tx_tnl_lso *tnl_lso = (void *)(wr + 1);
+		int eh_type;
+		struct ether_vlan_header *evh;
+
+		ctrl0 = htobe32(V_TXPKT_OPCODE(CPL_TX_PKT_XT) |
+						V_TXPKT_INTF(pi->tx_chan) |
+						V_TXPKT_PF(sc->pf));
+
+		MPASS(m0->m_pkthdr.l2hlen && m0->m_pkthdr.l3hlen);
+		evh = mtod(m0, struct ether_vlan_header *);
+		eh_type = ntohs(evh->evl_encap_proto);
+		if (eh_type == ETHERTYPE_VLAN)
+			eh_type = ntohs(evh->evl_proto);
+
+		MPASS(m0->m_pkthdr.tso_segsz);
+		cpl = (void *)(tnl_lso + 1);
+
+		/* Driver is expected to compute partial checksum that
+		 * does not include the IP Total Length.
+		 */
+		if (eh_type == ETHERTYPE_IP) {
+			struct ip *ip = (struct ip *)(m0->m_data + m0->m_pkthdr.l2hlen);
+			ip->ip_sum = 0;
+			ip->ip_len = 0;
+			ip->ip_sum = in_cksum_hdr(ip);
+		} else {
+			MPASS(eh_type == ETHERTYPE_IPV6);
+		}
+		ctrl1 = t6_fill_tnl_lso(m0, tnl_lso, tnl_type);
+
+		txq->txcsum++;	/* some hardware assistance provided */
 	} else
 		cpl = (void *)(wr + 1);
 
-	/* Checksum offload */
-	ctrl1 = 0;
-	if (needs_l3_csum(m0) == 0)
-		ctrl1 |= F_TXPKT_IPCSUM_DIS;
-	if (needs_l4_csum(m0) == 0)
-		ctrl1 |= F_TXPKT_L4CSUM_DIS;
-	if (m0->m_pkthdr.csum_flags & (CSUM_IP | CSUM_TCP | CSUM_UDP |
-	    CSUM_UDP_IPV6 | CSUM_TCP_IPV6 | CSUM_TSO))
-		txq->txcsum++;	/* some hardware assistance provided */
-
+	if (ctrl1 == 0) {
+		/* Checksum offload */
+		if (needs_l3_csum(m0) == 0)
+			ctrl1 |= F_TXPKT_IPCSUM_DIS;
+		if (needs_l4_csum(m0) == 0)
+			ctrl1 |= F_TXPKT_L4CSUM_DIS;
+		if (m0->m_pkthdr.csum_flags & (CSUM_IP | CSUM_TCP | CSUM_UDP |
+									   CSUM_UDP_IPV6 | CSUM_TCP_IPV6 | CSUM_TSO))
+			txq->txcsum++;	/* some hardware assistance provided */
+	}
 	/* VLAN tag insertion */
 	if (needs_vlan_insertion(m0)) {
 		ctrl1 |= F_TXPKT_VLAN_VLD | V_TXPKT_VLAN(m0->m_pkthdr.ether_vtag);
@@ -4287,7 +4735,7 @@ write_txpkt_wr(struct sge_txq *txq, struct fw_eth_tx_pkt_wr *wr,
 	}
 
 	/* CPL header */
-	cpl->ctrl0 = txq->cpl_ctrl0;
+	cpl->ctrl0 = ctrl0;
 	cpl->pack = 0;
 	cpl->len = htobe16(pktlen);
 	cpl->ctrl1 = htobe64(ctrl1);
@@ -4295,9 +4743,24 @@ write_txpkt_wr(struct sge_txq *txq, struct fw_eth_tx_pkt_wr *wr,
 	/* SGL */
 	dst = (void *)(cpl + 1);
 	if (nsegs > 0) {
+		if (dst == (void *)&eq->desc[eq->sidx]) {
+			dst = (void *)&eq->desc[0];
+			write_gl_to_txd(txq, m0, &dst, 0, pktno);
+		} else
+			write_gl_to_txd(txq, m0, &dst, eq->sidx - ndesc < eq->pidx, pktno);
 
-		write_gl_to_txd(txq, m0, &dst, eq->sidx - ndesc < eq->pidx);
 		txq->sgl_wrs++;
+	} else if (m_ismvec(m0)) {
+		struct mbuf_ext *m = (void*)m0;
+		struct mvec_ent *me;
+		int i;
+
+		me = &m->me_ents[m->me_mh.mh_start];
+		for (i = 0; i < m->me_mh.mh_used; i++, me++) {
+			copy_to_txd(eq, me_data(me), &dst, me->me_len);
+			pktlen -= me->me_len;
+		}
+		KASSERT(pktlen == 0, ("%s: %d bytes left.", __func__, pktlen));
 	} else {
 		struct mbuf *m;
 
@@ -4316,9 +4779,9 @@ write_txpkt_wr(struct sge_txq *txq, struct fw_eth_tx_pkt_wr *wr,
 	txq->txpkt_wrs++;
 
 	txsd = &txq->sdesc[eq->pidx];
-	txsd->m = m0;
+	if (pktno == -1)
+		txsd->m = m0;
 	txsd->desc_used = ndesc;
-
 	return (ndesc);
 }
 
@@ -4487,8 +4950,7 @@ write_txpkts_wr(struct sge_txq *txq, struct fw_eth_tx_pkts_wr *wr,
 		    (uintptr_t)flitp == (uintptr_t)&eq->desc[eq->sidx])
 			flitp = (void *)&eq->desc[0];
 
-		write_gl_to_txd(txq, m, (caddr_t *)(&flitp), checkwrap);
-
+		write_gl_to_txd(txq, m, (caddr_t *)(&flitp), checkwrap, -1);
 	}
 
 	if (txp->wr_type == 0) {
@@ -4511,28 +4973,36 @@ write_txpkts_wr(struct sge_txq *txq, struct fw_eth_tx_pkts_wr *wr,
  * add a 0 filled flit at the end.
  */
 static void
-write_gl_to_txd(struct sge_txq *txq, struct mbuf *m, caddr_t *to, int checkwrap)
+write_gl_to_txd(struct sge_txq *txq, struct mbuf *m, caddr_t *to, int checkwrap,
+				int pktidx)
 {
 	struct sge_eq *eq = &txq->eq;
 	struct sglist *gl = txq->gl;
 	struct sglist_seg *seg;
 	__be64 *flitp, *wrap;
 	struct ulptx_sgl *usgl;
-	int i, nflits, nsegs;
+	int i, nflits, start, nsegs;
 
 	KASSERT(((uintptr_t)(*to) & 0xf) == 0,
 	    ("%s: SGL must start at a 16 byte boundary: %p", __func__, *to));
 	MPASS((uintptr_t)(*to) >= (uintptr_t)&eq->desc[0]);
 	MPASS((uintptr_t)(*to) < (uintptr_t)&eq->desc[eq->sidx]);
 
-	get_pkt_gl(m, gl);
-	nsegs = gl->sg_nseg;
+	if (pktidx >= 0) {
+		MPASS(pktidx < TX_MAX_PKT_SEGS);
+		start = txq->pkt_offs[pktidx];
+		nsegs = txq->pkt_cnts[pktidx];
+	} else {
+		get_pkt_gl(m, gl);
+		nsegs = gl->sg_nseg;
+		start = 0;
+	}
 	MPASS(nsegs > 0);
 
 	nflits = (3 * (nsegs - 1)) / 2 + ((nsegs - 1) & 1) + 2;
 	flitp = (__be64 *)(*to);
 	wrap = (__be64 *)(&eq->desc[eq->sidx]);
-	seg = &gl->sg_segs[0];
+	seg = &gl->sg_segs[start];
 	usgl = (void *)flitp;
 
 	/*
@@ -4723,6 +5193,7 @@ reclaim_tx_descs(struct sge_txq *txq, u_int n)
 			m->m_nextpkt = NULL;
 			m_freem(m);
 		}
+		txsd->m = NULL;
 		reclaimed += ndesc;
 		can_reclaim -= ndesc;
 		IDXINCR(eq->cidx, ndesc, eq->sidx);
