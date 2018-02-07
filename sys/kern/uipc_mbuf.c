@@ -724,6 +724,10 @@ m_adj(struct mbuf *mp, int req_len)
 
 	if ((m = mp) == NULL)
 		return;
+	if (m_ismvec(mp)) {
+		mvec_adj(mp, req_len);
+		return;
+	}
 	if (len >= 0) {
 		/*
 		 * Trim from head.
@@ -802,6 +806,9 @@ m_pullup(struct mbuf *n, int len)
 	struct mbuf *m;
 	int count;
 	int space;
+
+	if (m_ismvec(n))
+		return (mvec_pullup(n, 0, len));
 
 	/*
 	 * If first mbuf has no cluster, and has room for len bytes
@@ -1249,6 +1256,11 @@ m_length(struct mbuf *m0, struct mbuf **last)
 	struct mbuf *m;
 	u_int len;
 
+	if (m0 && m_ismvec(m0)) {
+		MPASS(last == NULL);
+		return (mvec_pktlen(m0, NULL, -1));
+	}
+
 	len = 0;
 	for (m = m0; m != NULL; m = m->m_next) {
 		len += m->m_len;
@@ -1277,6 +1289,7 @@ m_defrag(struct mbuf *m0, int how)
 	struct mbuf *m_new = NULL, *m_final = NULL;
 	int progress = 0, length;
 
+	MPASS(!m_ismvec(m0));
 	MBUF_CHECKSLEEP(how);
 	if (!(m0->m_flags & M_PKTHDR))
 		return (m0);
@@ -1360,6 +1373,7 @@ m_collapse(struct mbuf *m0, int how, int maxfrags)
 	struct mbuf *m, *n, *n2, **prev;
 	u_int curfrags;
 
+	MPASS(!m_ismvec(m0));
 	/*
 	 * Calculate the current number of frags.
 	 */

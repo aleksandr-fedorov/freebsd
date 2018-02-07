@@ -174,6 +174,8 @@ static int	if_requestencap_default(struct ifnet *, struct if_encap_req *);
 static void	if_route(struct ifnet *, int flag, int fam);
 static int	if_setflag(struct ifnet *, int, int, int *, int);
 static int	if_transmit(struct ifnet *ifp, struct mbuf *m);
+static int	if_mbuf_to_qid(struct ifnet *ifp, struct mbuf *m);
+static int	if_transmit_txq(struct ifnet *ifp, struct mbuf *m);
 static void	if_unroute(struct ifnet *, int flag, int fam);
 static void	link_rtrequest(int, struct rtentry *, struct rt_addrinfo *);
 static int	ifhwioctl(u_long, struct ifnet *, caddr_t, struct thread *);
@@ -501,6 +503,15 @@ if_free_internal(struct ifnet *ifp)
 	KASSERT((ifp->if_flags & IFF_DYING),
 	    ("if_free_internal: interface not dying"));
 
+	CURVNET_SET_QUIET(ifp->if_vnet);
+	IFNET_WLOCK();
+	KASSERT(ifp == ifnet_byindex_locked(ifp->if_index),
+	    ("%s: freeing unallocated ifnet", ifp->if_xname));
+
+	ifindex_free_locked(ifp->if_index);
+	IFNET_WUNLOCK();
+	CURVNET_RESTORE();
+
 	if (if_com_free[ifp->if_alloctype] != NULL)
 		if_com_free[ifp->if_alloctype](ifp->if_l2com,
 		    ifp->if_alloctype);
@@ -529,17 +540,8 @@ if_free(struct ifnet *ifp)
 
 	ifp->if_flags |= IFF_DYING;			/* XXX: Locking */
 
-	CURVNET_SET_QUIET(ifp->if_vnet);
-	IFNET_WLOCK();
-	KASSERT(ifp == ifnet_byindex_locked(ifp->if_index),
-	    ("%s: freeing unallocated ifnet", ifp->if_xname));
-
-	ifindex_free_locked(ifp->if_index);
-	IFNET_WUNLOCK();
-
 	if (refcount_release(&ifp->if_refcount))
 		if_free_internal(ifp);
-	CURVNET_RESTORE();
 }
 
 /*
@@ -699,6 +701,10 @@ if_attach_internal(struct ifnet *ifp, int vmove, struct if_clone *ifc)
 	if (ifp->if_transmit == NULL) {
 		ifp->if_transmit = if_transmit;
 		ifp->if_qflush = if_qflush;
+	}
+	if (ifp->if_mbuf_to_qid == NULL) {
+		ifp->if_transmit_txq = if_transmit_txq;
+		ifp->if_mbuf_to_qid = if_mbuf_to_qid;
 	}
 	if (ifp->if_input == NULL)
 		ifp->if_input = if_input_default;
@@ -3671,6 +3677,46 @@ if_transmit(struct ifnet *ifp, struct mbuf *m)
 	return (error);
 }
 
+static int
+if_mbuf_to_qid(struct ifnet *ifp, struct mbuf *m)
+{
+	return (0);
+}
+
+static int
+if_transmit_txq(struct ifnet *ifp, struct mbuf *m)
+{
+	struct mbuf *mp, *mnext, *mchain;
+	int rc, lasterr;
+
+	mp = m;
+	lasterr = 0;
+	do {
+		mnext = mp->m_nextpkt;
+		mp->m_nextpkt = NULL;
+		if (m_ismvec(mp)) {
+			mchain = mvec_to_mchain(mp, M_NOWAIT);
+			if (__predict_false(mchain == NULL)) {
+				m_freem(mp);
+				rc = ENOMEM;
+			} else {
+				rc = if_transmit_txq(ifp, mchain);
+			}
+		} else
+			rc = ifp->if_transmit(ifp, mp);
+		if (__predict_false(rc)) {
+			lasterr = rc;
+			if (rc == ENOBUFS)
+				goto fail;
+		}
+		mp = mnext;
+	} while (mp != NULL);
+	return (lasterr);
+ fail:
+	m_freechain(mnext);
+	return (lasterr);
+}
+
 static void
 if_input_default(struct ifnet *ifp __unused, struct mbuf *m)
 {
@@ -4192,6 +4238,18 @@ if_setstartfn(if_t ifp, void (*start_fn)(if_t))
 }
 
 void
+if_settransmittxqfn(if_t ifp, if_transmit_fn_t fn)
+{
+	((struct ifnet *)ifp)->if_transmit_txq = fn;
+}
+
+void
+if_setmbuftoqidfn(if_t ifp, if_transmit_fn_t fn)
+{
+	((struct ifnet *)ifp)->if_mbuf_to_qid = fn;
+}
+void
+
 if_settransmitfn(if_t ifp, if_transmit_fn_t start_fn)
 {
 	((struct ifnet *)ifp)->if_transmit = start_fn;

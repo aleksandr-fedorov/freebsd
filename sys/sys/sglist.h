@@ -84,10 +84,19 @@ sglist_hold(struct sglist *sg)
 	return (sg);
 }
 
+struct sg_multipkt {
+	uint8_t *sm_cnts;
+	uint8_t *sm_offs;
+	uint16_t *sm_lens;
+	uint8_t *sm_pktcnt;
+};
+
 struct sglist *sglist_alloc(int nsegs, int mflags);
 int	sglist_append(struct sglist *sg, void *buf, size_t len);
 int	sglist_append_bio(struct sglist *sg, struct bio *bp);
 int	sglist_append_mbuf(struct sglist *sg, struct mbuf *m0);
+int	sglist_append_mvec(struct sglist *sg, struct mbuf *m0);
+int	sglist_append_mvec_multi(struct sglist *sg, struct mbuf *m0, struct sg_multipkt *sm);
 int	sglist_append_phys(struct sglist *sg, vm_paddr_t paddr,
 	    size_t len);
 int	sglist_append_sglist(struct sglist *sg, struct sglist *source,
@@ -101,6 +110,7 @@ struct sglist *sglist_build(void *buf, size_t len, int mflags);
 struct sglist *sglist_clone(struct sglist *sg, int mflags);
 int	sglist_consume_uio(struct sglist *sg, struct uio *uio, size_t resid);
 int	sglist_count(void *buf, size_t len);
+int	sglist_count_mvec_multi(struct mbuf *m, uint8_t *counts, uint8_t *offs, int countlen);
 int	sglist_count_vmpages(vm_page_t *m, size_t pgoff, size_t len);
 void	sglist_free(struct sglist *sg);
 int	sglist_join(struct sglist *first, struct sglist *second);

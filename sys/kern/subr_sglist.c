@@ -193,6 +193,40 @@ sglist_count(void *buf, size_t len)
 	return (nsegs);
 }
 
+int
+sglist_count_mvec_multi(struct mbuf *m0, uint8_t *lens, uint8_t *offs, int countlen)
+{
+	struct mbuf_ext *mext;
+	struct mvec_header *mh;
+	struct mvec_ent *me;
+	int i, pktsgs, pktsgstotal, pktno, cnt;
+
+	MPASS(m0 != NULL);
+	MPASS(lens != NULL);
+	MPASS(countlen > 0);
+
+	mext = (void*)m0;
+	mh = &mext->me_mh;
+	me = &mext->me_ents[mh->mh_start];
+
+	pktsgstotal = pktno = pktsgs = 0;
+	for (i = 0; i < mh->mh_used; i++, me++) {
+		if (pktsgs == 0)
+			offs[pktno] = pktsgstotal;
+		cnt = sglist_count(me_data(me), me->me_len);
+		pktsgs += cnt;
+		pktsgstotal += cnt;
+		if (me->me_eop) {
+			lens[pktno] = pktsgs;
+			pktno++;
+			pktsgs = 0;
+			if (__predict_false(pktno == countlen))
+				break;
+		}
+	}
+	return (pktno);
+}
+
 /*
  * Determine the number of scatter/gather list elements needed to
  * describe a buffer backed by an array of VM pages.
@@ -319,6 +353,58 @@ sglist_append_phys(struct sglist *sg, vm_paddr_t paddr, size_t len)
 	return (error);
 }
 
+int
+sglist_append_mvec_multi(struct sglist *sg, struct mbuf *m0, struct sg_multipkt *sm)
+{
+	struct sgsave save;
+	struct mbuf_ext *mext;
+	struct mvec_header *mh;
+	struct mvec_ent *me;
+	uint16_t ncur, nprev;
+	int i, error, pktno, pktsegs, curlen;
+
+	MPASS(m0 != NULL);
+
+	mext = (void*)m0;
+	mh = &mext->me_mh;
+	me = &mext->me_ents[mh->mh_start];
+
+	if (__predict_false(sg->sg_maxseg == 0))
+		return (EINVAL);
+
+	SGLIST_SAVE(sg, save);
+	curlen = pktsegs = error = pktno = ncur = nprev = 0;
+	for (i = 0; i < mh->mh_used; i++, me++) {
+		nprev = sg->sg_nseg;
+		if (sm && pktsegs == 0)
+			sm->sm_offs[pktno] = nprev;
+		if (__predict_true(me->me_len))
+			error = sglist_append(sg, me_data(me), me->me_len);
+		if (__predict_false(error)) {
+			SGLIST_RESTORE(sg, save);
+			return (error);
+		}
+		ncur = sg->sg_nseg;
+		pktsegs += (ncur - nprev);
+		curlen += me->me_len;
+		if (sm && me->me_eop) {
+			sm->sm_cnts[pktno] = pktsegs;
+			sm->sm_lens[pktno] = curlen;
+			pktno++;
+			curlen = pktsegs = 0;
+		}
+	}
+	if (sm)
+		*sm->sm_pktcnt = pktno;
+	return (0);
+}
+
+int
+sglist_append_mvec(struct sglist *sg, struct mbuf *m0)
+{
+	return (sglist_append_mvec_multi(sg, m0, NULL));
+}
+
 /*
  * Append the segments that describe a single mbuf chain to a
  * scatter/gather list.  If there are insufficient segments, then this
@@ -333,6 +419,9 @@ sglist_append_mbuf(struct sglist *sg, struct mbuf *m0)
 
 	if (sg->sg_maxseg == 0)
 		return (EINVAL);
+
+	if (m_ismvec(m0))
+		return (sglist_append_mvec(sg, m0));
 
 	error = 0;
 	SGLIST_SAVE(sg, save);

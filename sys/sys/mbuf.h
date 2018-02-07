@@ -167,7 +167,8 @@ struct pkthdr {
 			uint8_t		 l3hlen;	/* layer 3 hdr len */
 			uint8_t		 l4hlen;	/* layer 4 hdr len */
 			uint8_t		 l5hlen;	/* layer 5 hdr len */
-			uint32_t	 spare;
+			uint32_t	 encaplen:8;
+			uint32_t	 vxlanid:24;
 		};
 	};
 	union {
@@ -285,10 +286,185 @@ struct mbuf {
 	};
 };
 
+#define	MVEC_MANAGED	0x0		/* cluster should be freed when refcnt goes to 0 */
+#define	MVEC_UNMANAGED	0x1		/* memory managed elsewhere */
+#define	MVEC_MBUF	0x2		/* free to mbuf zone */
+
+#define MVALLOC_MALLOC	0x0		/* mvec was malloced with type M_MVEC */
+#define MVALLOC_MBUF	0x1		/* mvec was allocated from zone_mbuf */
+
+/*
+ * | mbuf { }| pkthdr { } | m_ext { }| mvec_header { } | mvec_ent[] | refcnt[] (optional) | 
+ */
+struct mvec_header {
+	uint64_t mh_count:7; /* number of segments */
+	uint64_t mh_start:7; /* starting segment */
+	uint64_t mh_used:7; /* segments in use */
+	uint64_t mh_mvtype:3; /* mvec allocation */
+	uint64_t mh_multiref:1; /* the clusters have independent ref counts so
+							 * an array of refcounts sits before the mvec_ents
+							 */
+	uint64_t mh_multipkt:1; /* contains multiple packets */
+	uint64_t mh_flags:38;
+};
+
+struct mvec_ent {
+	caddr_t		me_cl;
+	uint16_t	me_off;
+	uint16_t	me_len;
+	uint16_t	me_eop:1;
+	uint16_t	me_type:2;
+	uint16_t	me_spare:13;
+	uint8_t		me_ext_flags;
+	uint8_t		me_ext_type;
+};
+
+struct mbuf_ext {
+	struct mbuf me_mbuf;
+	struct mvec_header me_mh;
+	struct mvec_ent me_ents[0];
+};
+
+#ifdef _KERNEL
+#define MBUF2MH(m_) (&(((struct mbuf_ext *)(m_))->me_mh))
+#define MBUF2ME(m_) (((struct mbuf_ext *)(m_))->me_ents)
+#define MBUF2REF(m_) ((m_refcnt_t *)(MBUF2ME(m_) + MBUF2MH(m_)->mh_count))
+
+#define MHMEI(m_, mh_, idx_) (MBUF2ME(m_) + (mh_)->mh_start + (idx_))
+#define MHREFI(m_, mh_, idx_) (MBUF2REF(m_) + (mh_)->mh_start + (idx_))
+
+#define ME_SEG(m_, mh_, idx_) (MHMEI(m_, mh_,idx_)->me_cl + MHMEI(m_, mh_, idx_)->me_off)
+#define ME_LEN(m_, mh_, idx_) (MHMEI(m_, mh_,idx_)->me_len)
+
+#define MBUF_ME_MAX ((MHLEN - sizeof(struct m_ext) - sizeof(struct mvec_header))/sizeof(struct mvec_ent))
+
+#define m_ismvec(m) (((m)->m_flags & M_EXT) && ((m)->m_ext.ext_type == EXT_MVEC))
+#define me_data(me) ((me)->me_cl + (me)->me_off)
+/* XXX --- fix */
+#define ME_WRITABLE(m, i) (0)
+
+struct mvec_cursor {
+	uint16_t mc_idx;
+	uint16_t mc_off;
+};
+
+typedef union {
+		/*
+		 * If EXT_FLAG_EMBREF is set, then we use refcount in the
+		 * mbuf, the 'ext_count' member.  Otherwise, we have a
+		 * shadow copy and we use pointer 'ext_cnt'.  The original
+		 * mbuf is responsible to carry the pointer to free routine
+		 * and its arguments.  They aren't copied into shadows in
+		 * mb_dupcl() to avoid dereferencing next cachelines.
+		 */
+		volatile u_int	 ext_count;
+		volatile u_int	*ext_cnt;
+} m_refcnt_t;
+
+/*
+ * Get index and relative offset of `off` in to mvec `m`
+ */
+void *mvec_seek(const struct mbuf *m, struct mvec_cursor *mc, int off);
+
+
+void *mvec_seek_pktno(const struct mbuf *m, struct mvec_cursor *mc, int off, uint16_t pktno);
+
+
+uint32_t mvec_pktlen(const struct mbuf *m, struct mvec_cursor *mc, int pktno);
+
+/*
+ * Trim (destructively if unshared) `req_len` bytes of `m`.
+ * Will trim the front if req_len is positive and the tail
+ * if req_len is negative.
+ */
+void mvec_adj(struct mbuf *m, int req_len);
+
+/*
+ * Make the first `count` bytes of `m` index `idx` contiguous
+ */
+struct mbuf *mvec_pullup(struct mbuf *m, int idx, int count);
+
+/*
+ * Perform accounting neccesary to free all references contained
+ * and `m` itself
+ */
+void mvec_free(struct mbuf_ext *m);
+
+
+void mvec_buffer_free(struct mbuf *m);
+
+/*
+ * Convert mbuf chain `m` to mvec non-destructively. Returns
+ * NULL on failure. It is the caller's responsibility to free
+ * the source on success.
+ */
+struct mbuf_ext *mchain_to_mvec(struct mbuf *m, int how);
+
+struct mbuf_ext *pktchain_to_mvec(struct mbuf *m, int mtu, int how);
+
+
+/*
+ * Convert mvec `m` to mbuf chain non-destructively.
+ * Returns NULL if not successful. It is the caller's
+ * responsibility to free the source on success.
+ */
+struct mbuf *mvec_to_mchain(struct mbuf *m, int how);
+/*
+ * Given an mvec `m` returns a new mvec of segmented packets.
+ * If prehdrlen is non-zero the first prehdrlen bytes are
+ * treated as encapsulation and copied to the front of every
+ * packet. Non-destructive.
+ */
+struct mbuf_ext *mvec_tso(struct mbuf_ext *m, int prehdrlen, bool freesrc);
+
+/*
+ * Create size bytes of room at the front of `m`. Will allocate a
+ * new mvec if there is no room for an addition mvec_ent.
+ */
+struct mbuf *mvec_prepend(struct mbuf *m, int size);
+
+/*
+ * Append `cl` of type `cltype` and length `len` starting at `off`
+ * to mvec `m` - return a new mvec if `cl` won't fit in the existing
+ * entries.
+ */
+struct mbuf *mvec_append(struct mbuf *m, caddr_t cl, uint16_t off,
+						 uint16_t len, uint8_t cltype);
+
+/*
+ * Allocate mvec with `count` entries and `len` additional bytes.
+ */
+struct mbuf_ext *mvec_alloc(uint8_t count, int len, int how);
+
+/*
+ * Initialize an mbuf `m` from zone_mbuf as an mvec.
+ */
+int mvec_init_mbuf(struct mbuf *m, uint8_t count, uint8_t type);
+
+
+uint16_t mvec_cksum_skip(struct mbuf *m, int len, int skip);
+
+
+/*
+ * Mvec analogs to mbuf helpers that should be implemented sooner
+ * rather than later.
+ */
+void mvec_copydata(const struct mbuf *m, int off, int len, caddr_t cp);
+struct mbuf *mvec_dup(const struct mbuf *m, int how);
+struct mbuf *mvec_defrag(const struct mbuf *m, int how);
+struct mbuf *mvec_collapse(struct mbuf *m, int how, int maxfrags);
+
+#ifdef INVARIANTS
+void mvec_sanity(struct mbuf *m);
+#else
+static __inline void mvec_sanity(struct mbuf *m __unused) {}
+#endif
+
+#endif
 /*
  * mbuf flags of global significance and layer crossing.
  * Those of only protocol/layer specific significance are to be mapped
- * to M_PROTO[1-12] and cleared at layer handoff boundaries.
+ * to M_PROTO[1-11] and cleared at layer handoff boundaries.
  * NB: Limited to the lower 24 bits.
  */
 #define	M_EXT		0x00000001 /* has associated external storage */
@@ -317,7 +493,7 @@ struct mbuf {
 #define	M_PROTO9	0x00100000 /* protocol-specific */
 #define	M_PROTO10	0x00200000 /* protocol-specific */
 #define	M_PROTO11	0x00400000 /* protocol-specific */
-#define	M_PROTO12	0x00800000 /* protocol-specific */
+#define	M_VXLANTAG	0x00800000 /* vxlanid is valid */
 
 #define MB_DTOR_SKIP	0x1	/* don't pollute the cache by touching a freed mbuf */
 
@@ -326,14 +502,14 @@ struct mbuf {
  */
 #define	M_PROTOFLAGS \
     (M_PROTO1|M_PROTO2|M_PROTO3|M_PROTO4|M_PROTO5|M_PROTO6|M_PROTO7|M_PROTO8|\
-     M_PROTO9|M_PROTO10|M_PROTO11|M_PROTO12)
+     M_PROTO9|M_PROTO10|M_PROTO11)
 
 /*
  * Flags preserved when copying m_pkthdr.
  */
 #define M_COPYFLAGS \
     (M_PKTHDR|M_EOR|M_RDONLY|M_BCAST|M_MCAST|M_PROMISC|M_VLANTAG|M_TSTMP| \
-     M_TSTMP_HPREC|M_PROTOFLAGS)
+     M_TSTMP_HPREC|M_PROTOFLAGS|M_VXLANTAG)
 
 /*
  * Mbuf flag description for use with printf(9) %b identifier.
@@ -438,6 +614,7 @@ struct mbuf {
 #define	EXT_JUMBO16	5	/* jumbo cluster 16184 bytes */
 #define	EXT_PACKET	6	/* mbuf+cluster from packet zone */
 #define	EXT_MBUF	7	/* external mbuf reference */
+#define	EXT_MVEC	8	/* pointer to mbuf vector */
 
 #define	EXT_VENDOR1	224	/* for vendor-internal use */
 #define	EXT_VENDOR2	225	/* for vendor-internal use */
@@ -460,6 +637,8 @@ struct mbuf {
  */
 #define	EXT_FLAG_EMBREF		0x000001	/* embedded ext_count */
 #define	EXT_FLAG_EXTREF		0x000002	/* external ext_cnt, notyet */
+#define	EXT_FLAG_MVECREF	0x000004	/* reference is an mvec */
+#define	EXT_FLAG_EXTFREE	0x000008	/* ext_free is valid */
 
 #define	EXT_FLAG_NOFREE		0x000010	/* don't free mbuf to pool, notyet */
 
@@ -498,12 +677,16 @@ struct mbuf {
 #define	CSUM_IP_SCTP		0x00000008	/* SCTP checksum offload */
 #define	CSUM_IP_TSO		0x00000010	/* TCP segmentation offload */
 #define	CSUM_IP_ISCSI		0x00000020	/* iSCSI checksum offload */
+#define	CSUM_IP_VX_TSO		0x00000040	/* VXLAN TCP segmentation offload */
 
 #define	CSUM_IP6_UDP		0x00000200	/* UDP checksum offload */
 #define	CSUM_IP6_TCP		0x00000400	/* TCP checksum offload */
 #define	CSUM_IP6_SCTP		0x00000800	/* SCTP checksum offload */
 #define	CSUM_IP6_TSO		0x00001000	/* TCP segmentation offload */
 #define	CSUM_IP6_ISCSI		0x00002000	/* iSCSI checksum offload */
+#define	CSUM_IP6_VX_TSO		0x00004000	/* VXLAN TCP segmentation offload */
+
+#define	CSUM_IPSEC	   	0x00008000	/* IPSEC needs to be done on packet */
 
 /* Inbound checksum support where the checksum was verified by hardware. */
 #define	CSUM_L3_CALC		0x01000000	/* calculated layer 3 csum */
@@ -539,6 +722,7 @@ struct mbuf {
 #define	CSUM_UDP		CSUM_IP_UDP
 #define	CSUM_SCTP		CSUM_IP_SCTP
 #define	CSUM_TSO		(CSUM_IP_TSO|CSUM_IP6_TSO)
+#define	CSUM_VX_TSO		(CSUM_IP_VX_TSO|CSUM_IP6_VX_TSO)
 #define	CSUM_UDP_IPV6		CSUM_IP6_UDP
 #define	CSUM_TCP_IPV6		CSUM_IP6_TCP
 #define	CSUM_SCTP_IPV6		CSUM_IP6_SCTP
@@ -637,7 +821,6 @@ u_int		 m_fixhdr(struct mbuf *);
 struct mbuf	*m_fragment(struct mbuf *, int, int);
 void		 m_freem(struct mbuf *);
 struct mbuf	*m_get2(int, int, short, int);
-struct mbuf	*m_getjcl(int, short, int, int);
 struct mbuf	*m_getm2(struct mbuf *, int, int, short, int);
 struct mbuf	*m_getptr(struct mbuf *, int, int *);
 u_int		 m_length(struct mbuf *, struct mbuf **);
@@ -751,6 +934,7 @@ m_init(struct mbuf *m, int how, short type, int flags)
 	m->m_len = 0;
 	m->m_flags = flags;
 	m->m_type = type;
+	m->m_ext.ext_free = NULL;
 	if (flags & M_PKTHDR)
 		error = m_pkthdr_init(m, how);
 	else
@@ -783,19 +967,6 @@ m_gethdr(int how, short type)
 	args.type = type;
 	m = uma_zalloc_arg(zone_mbuf, &args, how);
 	MBUF_PROBE3(m__gethdr, how, type, m);
-	return (m);
-}
-
-static __inline struct mbuf *
-m_getcl(int how, short type, int flags)
-{
-	struct mbuf *m;
-	struct mb_args args;
-
-	args.flags = flags;
-	args.type = type;
-	m = uma_zalloc_arg(zone_pack, &args, how);
-	MBUF_PROBE4(m__getcl, how, type, flags, m);
 	return (m);
 }
 
@@ -838,12 +1009,37 @@ m_cljset(struct mbuf *m, void *cl, int type)
 	m->m_flags |= M_EXT;
 	MBUF_PROBE3(m__cljset, m, cl, type);
 }
-
-static __inline void
-m_chtype(struct mbuf *m, short new_type)
+/*
+ * m_getjcl() returns an mbuf with a cluster of the specified size attached.
+ * For size it takes MCLBYTES, MJUMPAGESIZE, MJUM9BYTES, MJUM16BYTES.
+ */
+static __inline struct mbuf *
+m_getjcl(int how, short type, int flags, int size)
 {
+	struct mb_args args;
+	struct mbuf *m, *n;
+	uma_zone_t zone;
 
-	m->m_type = new_type;
+	args.flags = flags;
+	args.type = type;
+
+	m = uma_zalloc_arg(zone_mbuf, &args, how);
+	if (m == NULL)
+		return (NULL);
+
+	zone = m_getzone(size);
+	n = uma_zalloc_arg(zone, m, how);
+	if (n == NULL) {
+		uma_zfree(zone_mbuf, m);
+		return (NULL);
+	}
+	return (m);
+}
+
+static __inline struct mbuf *
+m_getcl(int how, short type, int flags)
+{
+	return (m_getjcl(how, type, flags, MCLBYTES));
 }
 
 static __inline void
@@ -1007,12 +1203,6 @@ m_align(struct mbuf *m, int len)
 		_mm->m_pkthdr.len += _mplen;				\
 	*_mmp = _mm;							\
 } while (0)
-
-/*
- * Change mbuf to new type.  This is a relatively expensive operation and
- * should be avoided.
- */
-#define	MCHTYPE(m, t)	m_chtype((m), (t))
 
 /* Length to m_copy to copy all. */
 #define	M_COPYALL	1000000000
@@ -1217,6 +1407,19 @@ m_free(struct mbuf *m)
 	else if ((m->m_flags & M_NOFREE) == 0)
 		uma_zfree(zone_mbuf, m);
 	return (n);
+}
+
+static __inline void
+m_freechain(struct mbuf *m)
+{
+	struct mbuf *mp, *mnext;
+
+	mp = m;
+	while (mp != NULL) {
+		mnext = mp->m_nextpkt;
+		m_freem(mp);
+		mp = mnext;
+	}
 }
 
 static __inline int

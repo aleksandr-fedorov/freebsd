@@ -445,10 +445,11 @@ mb_dtor_mbuf(void *mem, int size, void *arg)
 
 	m = (struct mbuf *)mem;
 	flags = (unsigned long)arg;
-
-	KASSERT((m->m_flags & M_NOFREE) == 0, ("%s: M_NOFREE set", __func__));
-	if (!(flags & MB_DTOR_SKIP) && (m->m_flags & M_PKTHDR) && !SLIST_EMPTY(&m->m_pkthdr.tags))
-		m_tag_delete_chain(m, NULL);
+	if (!(flags & MB_DTOR_SKIP)) {
+		KASSERT((m->m_flags & M_NOFREE) == 0, ("%s: M_NOFREE set", __func__));
+		if ((m->m_flags & M_PKTHDR) && !SLIST_EMPTY(&m->m_pkthdr.tags))
+			m_tag_delete_chain(m, NULL);
+	}
 #ifdef INVARIANTS
 	trash_dtor(mem, size, arg);
 #endif
@@ -654,6 +655,16 @@ mb_free_ext(struct mbuf *m)
 
 	/* Free attached storage if this mbuf is the only reference to it. */
 	if (*refcnt == 1 || atomic_fetchadd_int(refcnt, -1) == 1) {
+		/*
+		 * An mvec has been converted to an mbuf chain, but is still
+		 * owned by the mvec.
+		 */
+		if (__predict_false(m->m_ext.ext_flags & EXT_FLAG_MVECREF)) {
+			MPASS(!(m->m_ext.ext_flags & EXT_FLAG_EMBREF));
+			MPASS(mref != m);
+			mvec_free((struct mbuf_ext *)mref);
+			goto skip;
+		}
 		switch (m->m_ext.ext_type) {
 		case EXT_PACKET:
 			/* The packet zone is special. */
@@ -677,6 +688,18 @@ mb_free_ext(struct mbuf *m)
 			uma_zfree(zone_jumbo16, m->m_ext.ext_buf);
 			uma_zfree(zone_mbuf, mref);
 			break;
+		case EXT_MBUF:
+			uma_zfree(zone_mbuf, m->m_ext.ext_buf);
+			break;
+		case EXT_MVEC:
+			if (m->m_ext.ext_flags & EXT_FLAG_EXTFREE) {
+				KASSERT(m->m_ext.ext_free != NULL,
+						("%s: ext_free not set", __func__));
+				m->m_ext.ext_free(m);
+			} else
+				mvec_free((struct mbuf_ext*)m);
+			return;
+			break;
 		case EXT_SFBUF:
 		case EXT_NET_DRV:
 		case EXT_MOD_TYPE:
@@ -696,7 +719,7 @@ mb_free_ext(struct mbuf *m)
 				("%s: unknown ext_type", __func__));
 		}
 	}
-
+ skip:
 	if (freembuf && m != mref)
 		uma_zfree(zone_mbuf, m);
 }
@@ -794,36 +817,6 @@ m_get2(int size, int how, short type, int flags)
 		return (NULL);
 	}
 
-	return (m);
-}
-
-/*
- * m_getjcl() returns an mbuf with a cluster of the specified size attached.
- * For size it takes MCLBYTES, MJUMPAGESIZE, MJUM9BYTES, MJUM16BYTES.
- */
-struct mbuf *
-m_getjcl(int how, short type, int flags, int size)
-{
-	struct mb_args args;
-	struct mbuf *m, *n;
-	uma_zone_t zone;
-
-	if (size == MCLBYTES)
-		return m_getcl(how, type, flags);
-
-	args.flags = flags;
-	args.type = type;
-
-	m = uma_zalloc_arg(zone_mbuf, &args, how);
-	if (m == NULL)
-		return (NULL);
-
-	zone = m_getzone(size);
-	n = uma_zalloc_arg(zone, m, how);
-	if (n == NULL) {
-		uma_zfree(zone_mbuf, m);
-		return (NULL);
-	}
 	return (m);
 }
 

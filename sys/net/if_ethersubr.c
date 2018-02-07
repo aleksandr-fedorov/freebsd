@@ -491,7 +491,6 @@ ether_input_internal(struct ifnet *ifp, struct mbuf *m)
 	}
 	eh = mtod(m, struct ether_header *);
 	etype = ntohs(eh->ether_type);
-	random_harvest_queue(m, sizeof(*m), 2, RANDOM_NET_ETHER);
 
 	CURVNET_SET_QUIET(ifp->if_vnet);
 
@@ -514,7 +513,8 @@ ether_input_internal(struct ifnet *ifp, struct mbuf *m)
 	/*
 	 * Give bpf a chance at the packet.
 	 */
-	ETHER_BPF_MTAP(ifp, m);
+	if (!(m->m_flags & M_VXLANTAG))
+		ETHER_BPF_MTAP(ifp, m);
 
 	/*
 	 * If the CRC is still on the packet, trim it off. We do this once
@@ -631,7 +631,8 @@ ether_input_internal(struct ifnet *ifp, struct mbuf *m)
 		 * re-entry (e.g. bridge, vlan, netgraph) but should not be
 		 * seen by upper protocol layers.
 		 */
-		if (!ETHER_IS_MULTICAST(eh->ether_dhost) &&
+		if (!(m->m_flags & M_VXLANTAG) &&
+			!ETHER_IS_MULTICAST(eh->ether_dhost) &&
 		    bcmp(IF_LLADDR(ifp), eh->ether_dhost, ETHER_ADDR_LEN) != 0)
 			m->m_flags |= M_PROMISC;
 	}
@@ -1181,6 +1182,12 @@ static moduledata_t ether_mod = {
 	.name = "ether",
 };
 
+void
+ether_vlan_mtapv(struct bpf_if *bp, struct mbuf *m, void *data, u_int dlen, u_int pktno)
+{
+	panic("XXX implmement me");
+}
+	
 void
 ether_vlan_mtap(struct bpf_if *bp, struct mbuf *m, void *data, u_int dlen)
 {
