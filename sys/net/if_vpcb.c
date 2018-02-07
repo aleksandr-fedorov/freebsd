@@ -442,7 +442,6 @@ vpcb_process_one(struct vpcb_softc *vs, struct mbuf **mp)
 	struct ether_header *eh;
 	struct mbuf *m;
 	struct vpcb_if *vi;
-	//int rc;
 
 	m = *mp;
 	eh = (void*)m->m_data;
@@ -455,11 +454,16 @@ vpcb_process_one(struct vpcb_softc *vs, struct mbuf **mp)
 		if ((vi->vi_vni ^ m->m_pkthdr.ether_vtag) |
 			(vi->vi_vlanid ^ m->m_pkthdr.vxlanid)) {
 			m_freem(m);
-			return (EINVAL);
+			return (ENOBUFS);
 		}
 		m->m_pkthdr.rcvif = vi->vi_if;
-	} else
+	} else {
+		if (vs->vs_ifdefault == NULL) {
+			m_freem(m);
+			return (ENOBUFS);
+		}
 		m->m_pkthdr.rcvif = vs->vs_ifdefault;
+	}
 	vpcb_cache_update(m);
 	return (0);
 }
@@ -535,11 +539,15 @@ vpcb_cloneattach(if_ctx_t ctx, struct if_clone *ifc, const char *name, caddr_t p
 								 UID_ROOT, GID_VPC, 0660, "vpcbctl");
 	if (vs->vs_vpcbctldev == NULL)
 		return (ENOMEM);
-	vs->vs_vpcbctldev->si_drv1 = vs;
-	refcount_init(&vs->vs_refcnt, 0);
 	refcount_acquire(&modrefcnt);
+
 	scctx = vs->shared = iflib_get_softc_ctx(ctx);
 	vs->vs_ctx = ctx;
+	refcount_init(&vs->vs_refcnt, 0);
+	vs->vs_vpcbctldev->si_drv1 = vs;
+	mtx_init(&vs->vs_lock, "vpcb softc", NULL, MTX_DEF);
+	LIST_INIT(&vs->vs_if_list);
+	art_tree_init(&vs->vs_ftable, ETHER_ADDR_LEN);
 	return (0);
 }
 
