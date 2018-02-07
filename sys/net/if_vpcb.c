@@ -86,15 +86,12 @@ static MALLOC_DEFINE(M_VPCB, "vpcb", "virtual private cloud bridge");
 
 struct vpcb_source {
 	uint16_t vs_dmac[3]; /* destination mac address */
-	uint16_t vs_svlanid; /* source vlanid */
-	uint32_t vs_svni;	/* source vni */
+	uint16_t vs_vlanid; /* source vlanid */
+	uint32_t vs_vni;	/* source vni */
 };
 
 struct vpcb_cache_ent {
 	struct vpcb_source vce_src;
-	uint32_t vce_dvni;	/* destination vni */
-	uint16_t vce_dvlanid:12; /* destination vlanid */
-	uint16_t vce_policy:4; /* policy: trusted, IPSEC, etc */
 	uint16_t vce_ifindex;	/* interface index */
 	int vce_ticks;		/* time when entry was created */
 };
@@ -130,6 +127,7 @@ struct vpcb_softc {
 	struct vpcb_mcast_queue vs_vmq;
 	art_tree vs_ftable;
 	LIST_HEAD(, vpcb_if) vs_if_list;
+	struct ifnet *vs_ifdefault;
 };
 
 static d_ioctl_t vpcbctl_ioctl;
@@ -293,6 +291,7 @@ vpcbctl_ioctl(struct cdev *dev, unsigned long cmd, caddr_t data,
 	}
 	return (0);
 }
+
 static __inline int
 hdrcmp(struct vpcb_source *vlhs, struct vpcb_source *vrhs)
 {
@@ -319,8 +318,8 @@ vpcb_cache_lookup(struct mbuf *m)
 
 	eh = (void*)m->m_data;
 	mac = (uint16_t *)eh->ether_dhost;
-	vsrc.vs_svlanid = m->m_pkthdr.ether_vtag;
-	vsrc.vs_svni = m->m_pkthdr.vxlanid;
+	vsrc.vs_vlanid = m->m_pkthdr.ether_vtag;
+	vsrc.vs_vni = m->m_pkthdr.vxlanid;
 	vsrc.vs_dmac[0] = mac[0];
 	vsrc.vs_dmac[1] = mac[1];
 	vsrc.vs_dmac[2] = mac[2];
@@ -345,8 +344,6 @@ vpcb_cache_lookup(struct mbuf *m)
 	 */
 	if (hdrcmp(&vcep->vce_src, &vsrc) == 0) {
 		/* cache hit */
-		m->m_pkthdr.ether_vtag = vcep->vce_dvlanid;
-		m->m_pkthdr.vxlanid = vcep->vce_dvni;
 		_critical_exit();
 		m->m_pkthdr.rcvif = ifp;
 		return (1);
@@ -358,7 +355,7 @@ vpcb_cache_lookup(struct mbuf *m)
 }
 
 static void
-vpcb_cache_update(struct mbuf *m, uint32_t dvni, uint16_t dvlanid)
+vpcb_cache_update(struct mbuf *m)
 {
 	struct vpcb_cache_ent *vcep;
 	struct vpcb_source *vsrc;
@@ -370,13 +367,11 @@ vpcb_cache_update(struct mbuf *m, uint32_t dvni, uint16_t dvlanid)
 	_critical_enter();
 	vcep = DPCPU_GET(hdr_cache);
 	vsrc = &vcep->vce_src;
-	vsrc->vs_svlanid = m->m_pkthdr.ether_vtag;
-	vsrc->vs_svni = m->m_pkthdr.vxlanid;
+	vsrc->vs_vlanid = m->m_pkthdr.ether_vtag;
+	vsrc->vs_vni = m->m_pkthdr.vxlanid;
 	vsrc->vs_dmac[0] = mac[0];
 	vsrc->vs_dmac[1] = mac[1];
 	vsrc->vs_dmac[2] = mac[2];
-	vcep->vce_dvni = dvni;
-	vcep->vce_dvlanid = dvlanid;
 	vcep->vce_ifindex = m->m_pkthdr.rcvif->if_index;
 	vcep->vce_ticks = ticks;
 	_critical_exit();
@@ -447,36 +442,25 @@ vpcb_process_one(struct vpcb_softc *vs, struct mbuf **mp)
 	struct ether_header *eh;
 	struct mbuf *m;
 	struct vpcb_if *vi;
-	int vxlanid;
 	//int rc;
 
 	m = *mp;
 	eh = (void*)m->m_data;
-	if (__predict_false(ETHER_IS_MULTICAST(eh->ether_dhost))) {
+	if (__predict_false(ETHER_IS_MULTICAST(eh->ether_dhost)))
 		return (vpcb_process_mcast(vs, mp));
-	}
 	if (vpcb_cache_lookup(m))
 		return (0);
-#ifdef notyet
-	vxlanid = (m->m_flags & M_VXLANTAG) ? m->m_pkthdr.vxlanid : 0;
-	ftable = vpc_vxlanid_lookup(vs, &vxlanid);
-	if (ftable == NULL) {
-		m_freem(m);
-		*mp = NULL;
-		return (ENOENT);
-	}
-	vi = art_search(ftable, (const unsigned char *)eh->ether_dhost);
-
+	vi = art_search(&vs->vs_ftable, (const unsigned char *)eh->ether_dhost);
 	if (vi != NULL) {
+		if ((vi->vi_vni ^ m->m_pkthdr.ether_vtag) |
+			(vi->vi_vlanid ^ m->m_pkthdr.vxlanid)) {
+			m_freem(m);
+			return (EINVAL);
+		}
 		m->m_pkthdr.rcvif = vi->vi_if;
-		vpcb_cache_update(m, vi->vi_vni, vi->vi_vlanid);
-		m->m_pkthdr.vxlanid = vi->vi_vni;
-		m->m_pkthdr.ether_vtag = vi->vi_vlanid;
-	} else {
+	} else
 		m->m_pkthdr.rcvif = vs->vs_ifdefault;
-		vpcb_cache_update(m, 0, 0);
-	}
-#endif 	
+	vpcb_cache_update(m);
 	return (0);
 }
 
