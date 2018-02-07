@@ -132,7 +132,6 @@ struct vpcb_softc {
 	LIST_HEAD(, vpcb_if) vs_if_list;
 };
 
-
 static d_ioctl_t vpcbctl_ioctl;
 static d_open_t vpcbctl_open;
 static d_close_t vpcbctl_close;
@@ -348,8 +347,6 @@ vpcb_cache_lookup(struct mbuf *m)
 		/* cache hit */
 		m->m_pkthdr.ether_vtag = vcep->vce_dvlanid;
 		m->m_pkthdr.vxlanid = vcep->vce_dvni;
-		if (vcep->vce_policy == VCE_IPSEC)
-			m->m_pkthdr.csum_flags |= CSUM_IPSEC;
 		_critical_exit();
 		m->m_pkthdr.rcvif = ifp;
 		return (1);
@@ -361,7 +358,7 @@ vpcb_cache_lookup(struct mbuf *m)
 }
 
 static void
-vpcb_cache_update(struct mbuf *m, uint32_t dvni, uint16_t dvlanid, uint8_t policy)
+vpcb_cache_update(struct mbuf *m, uint32_t dvni, uint16_t dvlanid)
 {
 	struct vpcb_cache_ent *vcep;
 	struct vpcb_source *vsrc;
@@ -380,7 +377,6 @@ vpcb_cache_update(struct mbuf *m, uint32_t dvni, uint16_t dvlanid, uint8_t polic
 	vsrc->vs_dmac[2] = mac[2];
 	vcep->vce_dvni = dvni;
 	vcep->vce_dvlanid = dvlanid;
-	vcep->vce_policy = policy;
 	vcep->vce_ifindex = m->m_pkthdr.rcvif->if_index;
 	vcep->vce_ticks = ticks;
 	_critical_exit();
@@ -450,6 +446,8 @@ vpcb_process_one(struct vpcb_softc *vs, struct mbuf **mp)
 {
 	struct ether_header *eh;
 	struct mbuf *m;
+	struct vpcb_if *vi;
+	int vxlanid;
 	//int rc;
 
 	m = *mp;
@@ -459,12 +457,27 @@ vpcb_process_one(struct vpcb_softc *vs, struct mbuf **mp)
 	}
 	if (vpcb_cache_lookup(m))
 		return (0);
-	/*
-	 * Do proper lookup and translation 
-	 * 
-	 *
-	 */
-	return (ENXIO);
+#ifdef notyet
+	vxlanid = (m->m_flags & M_VXLANTAG) ? m->m_pkthdr.vxlanid : 0;
+	ftable = vpc_vxlanid_lookup(vs, &vxlanid);
+	if (ftable == NULL) {
+		m_freem(m);
+		*mp = NULL;
+		return (ENOENT);
+	}
+	vi = art_search(ftable, (const unsigned char *)eh->ether_dhost);
+
+	if (vi != NULL) {
+		m->m_pkthdr.rcvif = vi->vi_if;
+		vpcb_cache_update(m, vi->vi_vni, vi->vi_vlanid);
+		m->m_pkthdr.vxlanid = vi->vi_vni;
+		m->m_pkthdr.ether_vtag = vi->vi_vlanid;
+	} else {
+		m->m_pkthdr.rcvif = vs->vs_ifdefault;
+		vpcb_cache_update(m, 0, 0);
+	}
+#endif 	
+	return (0);
 }
 
 static int
