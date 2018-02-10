@@ -100,6 +100,8 @@ struct vpcb_port {
 	_IOW('k', 2, struct vpcb_port)
 #define VPCB_PORT_DEL						\
 	_IOW('k', 3, struct vpcb_port)
+#define VPCB_PORT_TRUNK						\
+	_IOW('k', 4, struct vpcb_port)
 
 
 #define VPCB_REQ_NDv4 0x1
@@ -228,7 +230,7 @@ vpc_epoch_end(void)
 }
 
 int vpc_ifp_cache(struct ifnet *ifp);
-
+int vpcb_output(struct ifnet *ifp, struct mbuf *m);
 #endif
 
 #endif

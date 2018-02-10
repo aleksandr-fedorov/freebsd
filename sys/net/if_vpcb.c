@@ -119,6 +119,7 @@ struct vpcb_mcast_queue {
 struct vpcb_softc {
 	if_softc_ctx_t shared;
 	if_ctx_t vs_ctx;
+	if_t vs_ifp;
 	struct cdev *vs_vpcbctldev;
 	volatile int32_t vs_refcnt;
 	struct mtx vs_lock;
@@ -126,6 +127,7 @@ struct vpcb_softc {
 	struct vpcb_mcast_queue vs_vmq;
 	art_tree *vs_ftable_ro;
 	art_tree *vs_ftable_rw;
+	void (*vs_oinput)(struct ifnet *, struct mbuf *);
 	struct ifnet *vs_ifdefault;
 };
 
@@ -384,7 +386,7 @@ vpcb_cache_update(struct mbuf *m)
 }
 
 static int
-vpc_broadcast_one(void *data, const unsigned char *key, uint32_t key_len, void *value)
+vpc_broadcast_one(void *data, const unsigned char *key __unused, uint32_t key_len __unused, void *value)
 {
 	struct ifnet *ifp;
 	uint16_t *ifindexp = value;
@@ -452,8 +454,17 @@ vpcb_process_mcast(struct vpcb_softc *vs, struct mbuf **msrc)
 		*msrc = NULL;
 	} else if (!(m->m_flags & M_VXLANTAG)) {
 		art_iter(vs->vs_ftable_ro, vpc_broadcast_one, m);
-		if (__predict_true(vs->vs_ifdefault != NULL))
-			vs->vs_ifdefault->if_transmit_txq(vs->vs_ifdefault, m);
+		if (__predict_true(vs->vs_ifdefault != NULL)) {
+			/*
+			 * If it's from the network also pass it to default input
+			 * otherwise send it off to the network
+			 */
+			if (m->m_flags & M_TRUNK)
+				vs->vs_oinput(vs->vs_ifdefault, m);
+			else
+				vs->vs_ifdefault->if_transmit_txq(vs->vs_ifdefault, m);
+		} else
+			m_freem(m);
 	} else
 		m_freem(m);
 	return (0);
@@ -573,6 +584,20 @@ vpcb_input(if_t ifp, struct mbuf *m)
 	vpcb_transit(ifp, m);
 }
 
+int
+vpcb_output(struct ifnet *ifp, struct mbuf *m)
+{
+	struct vpcb_softc *vs;
+
+	if (__predict_false(ifp->if_bridge == NULL)) {
+		m_freem(m);
+		return (ENOBUFS);
+	}
+	vs = ifp->if_bridge;
+	m->m_flags &= ~M_PROMISC;
+	return (vpcb_transmit(vs->vs_ifp, m));
+}
+
 static int
 vpcb_cloneattach(if_ctx_t ctx, struct if_clone *ifc, const char *name, caddr_t params)
 {
@@ -591,6 +616,7 @@ vpcb_cloneattach(if_ctx_t ctx, struct if_clone *ifc, const char *name, caddr_t p
 
 	scctx = vs->shared = iflib_get_softc_ctx(ctx);
 	vs->vs_ctx = ctx;
+	vs->vs_ifp = iflib_get_ifp(ctx);
 	refcount_init(&vs->vs_refcnt, 0);
 	vs->vs_vpcbctldev->si_drv1 = vs;
 	mtx_init(&vs->vs_lock, "vpcb softc", NULL, MTX_DEF);
@@ -628,9 +654,15 @@ vpcb_port_add(struct vpcb_softc *vs, struct vpcb_port *port)
 		if_rele(ifp);
 		return (EBUSY);
 	}
+	if (ifp->if_bridge != NULL) {
+		if (bootverbose)
+			printf("%s already part of a bridge\n", port->vp_if);
+		return (EBUSY);
+	}
 	ifindexp = malloc(sizeof(uint16_t), M_VPCB, M_WAITOK);
 	*ifindexp = ifp->if_index;
 	vpc_ifp_cache(ifp);
+	ifp->if_bridge = vs;
 	art_insert(vs->vs_ftable_rw, LLADDR(sdl), ifindexp);
 	rc = vpc_art_tree_clone(vs->vs_ftable_rw, &newftable, M_VPCB);
 	if (rc)
@@ -684,12 +716,47 @@ vpcb_port_delete(struct vpcb_softc *vs, struct vpcb_port *port)
 	vs->vs_ftable_ro = newftable;
 	ck_epoch_synchronize(&vpc_global_record);
 	vpc_art_free(oldftable, M_VPCB);
+	ifp->if_bridge = NULL;
 	if_rele(ifp);
 	return (0);
  fail:
 	free(ifindexp, M_VPCB);
 	if_rele(ifp);
 	return (rc);
+}
+
+static int
+vpcb_port_trunk(struct vpcb_softc *vs, struct vpcb_port *port)
+{
+	struct ifnet *ifp;
+	struct sockaddr_dl *sdl;
+
+	port->vp_if[IFNAMSIZ-1] = '\0';
+	if ((ifp = ifunit_ref(port->vp_if)) == NULL) {
+		if (bootverbose)
+			printf("couldn't reference %s\n", port->vp_if);
+		return (ENXIO);
+	}
+	sdl = (struct sockaddr_dl *)ifp->if_addr->ifa_addr;
+	if (sdl->sdl_type != IFT_ETHER) {
+		if_rele(ifp);
+		return (EINVAL);
+	}
+	/* Verify ifnet not already in use */
+	if (art_search(vs->vs_ftable_rw, LLADDR(sdl)) != NULL) {
+		if (bootverbose)
+			printf("%s in use\n", port->vp_if);
+		if_rele(ifp);
+		return (EBUSY);
+	}
+	if (vs->vs_ifdefault != NULL) {
+		vs->vs_ifdefault->if_input = vs->vs_oinput;
+		if_rele(vs->vs_ifdefault);
+	}
+	vs->vs_ifdefault = ifp;
+	vs->vs_oinput = ifp->if_input;
+	ifp->if_input = vpcb_input;
+	return (0);
 }
 
 static int
@@ -724,6 +791,9 @@ vpcb_priv_ioctl(if_ctx_t ctx, u_long command, caddr_t data)
 		case VPCB_PORT_DEL:
 			rc = vpcb_port_delete(vs, (struct vpcb_port *)iod);
 			break;
+		case VPCB_PORT_TRUNK:
+			rc = vpcb_port_trunk(vs, (struct vpcb_port *)iod);
+			break;
 		default:
 			rc = ENOTSUP;
 	}
@@ -751,13 +821,49 @@ vpcb_attach_post(if_ctx_t ctx)
 }
 
 static int
+clear_bridge(void *data __unused, const unsigned char *key __unused, uint32_t key_len __unused, void *value)
+{
+	uint16_t *ifindexp = value;
+	struct ifnet *ifp;
+
+	ifp = vpc_ic->ic_ifps[*ifindexp];
+	if (ifp == NULL)
+		return (0);
+	if (ifp->if_flags & IFF_DYING) {
+		GROUPTASK_ENQUEUE(&vpc_ifp_task);
+		return (0);
+	}
+	ifp->if_bridge = NULL;
+	return (0);
+}
+
+static int
 vpcb_detach(if_ctx_t ctx)
 {
 	struct vpcb_softc *vs = iflib_get_softc(ctx);
+	struct vpcb_mcast_queue *vmq;
+	struct mbuf *m;
 
 	if (vs->vs_refcnt != 0)
 		return (EBUSY);
 
+	ck_epoch_synchronize(&vpc_global_record);
+
+	vmq = &vs->vs_vmq;
+	while (vmq->vmq_mh != NULL) {
+		m = vmq->vmq_mh;
+		vmq->vmq_mh = m->m_nextpkt;
+		m_freem(m);
+	}
+	if (vs->vs_ifdefault != NULL) {
+		vs->vs_ifdefault->if_input = vs->vs_oinput;
+		if_rele(vs->vs_ifdefault);
+	}
+
+	art_iter(vs->vs_ftable_rw, clear_bridge, NULL);
+	mtx_destroy(&vs->vs_lock);
+	vpc_art_free(vs->vs_ftable_ro, M_VPCB);
+	vpc_art_free(vs->vs_ftable_rw, M_VPCB);
 	destroy_dev(vs->vs_vpcbctldev);
 	refcount_release(&modrefcnt);
 	return (0);
