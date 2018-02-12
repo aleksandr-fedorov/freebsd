@@ -399,6 +399,7 @@ SUBDIR=	\
 	videomode \
 	vkbd \
 	${_vmm} \
+	${_vmmnet} \
 	${_vmware} \
 	${_vpo} \
 	vr \
@@ -729,6 +730,7 @@ _sgx_linux=	sgx_linux
 
 .if ${MK_BHYVE} != "no" || defined(ALL_MODULES)
 _vmm=		vmm
+_vmmnet=	vmmnet
 .endif
 .endif
 
