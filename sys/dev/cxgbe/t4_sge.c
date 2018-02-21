@@ -2393,8 +2393,9 @@ restart:
 		*mp = m0 = m;	/* update caller's copy after defrag */
 		goto restart;
 	}
-
-	if (__predict_false(nsegs > 2 && m0->m_pkthdr.len <= MHLEN)) {
+#if 0
+	if (__predict_false(nsegs > 2 && m0->m_pkthdr.len <= MHLEN &&
+						!m_ismvec(m))) {
 		m0 = m_pullup(m0, m0->m_pkthdr.len);
 		if (m0 == NULL) {
 			/* Should have left well enough alone. */
@@ -2404,6 +2405,7 @@ restart:
 		*mp = m0;	/* update caller's copy after pullup */
 		goto restart;
 	}
+#endif
 	set_mbuf_nsegs(m0, nsegs);
 	if (sc->flags & IS_VF)
 		set_mbuf_len16(m0, txpkt_vm_len16(nsegs, needs_tso(m0)));
