@@ -50,6 +50,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/protosw.h>
 #include <sys/uio.h>
 #include <sys/sdt.h>
+#include <sys/kdb.h>
 
 SDT_PROBE_DEFINE5_XLATE(sdt, , , m__init,
     "struct mbuf *", "mbufinfo_t *",
@@ -1289,10 +1290,16 @@ m_defrag(struct mbuf *m0, int how)
 	struct mbuf *m_new = NULL, *m_final = NULL;
 	int progress = 0, length;
 
-	MPASS(!m_ismvec(m0));
 	MBUF_CHECKSLEEP(how);
 	if (!(m0->m_flags & M_PKTHDR))
 		return (m0);
+
+	if (__predict_false(m_ismvec(m0))) {
+		kdb_backtrace();
+		panic("m_defrag not supported on mvec");
+	}
+
+	MPASS(!m_ismvec(m0));
 
 	m_fixhdr(m0); /* Needed sanity check */
 
