@@ -1485,16 +1485,21 @@ vtnet_be_cleanup(struct vtnet_be *vb)
 
 static if_pseudo_t vb_pseudo;
 
-void
+static void
 vmm_vtnet_be_modinit(void)
 {
 	vb_pseudo = vb_clone_register();
 	mtx_init(&vb_mtx, "vtnet_be", NULL, MTX_DEF);
 }
 
+SYSINIT(vtnet_init, SI_SUB_LAST, SI_ORDER_FIRST,
+	vmm_vtnet_be_modinit, NULL);
+
 void
 vmm_vtnet_be_modunload(void)
 {
+	if (vb_pseudo == NULL)
+		return;
 	iflib_clone_deregister(vb_pseudo);
 	mtx_destroy(&vb_mtx);
 }
@@ -1536,7 +1541,7 @@ vb_if_attach(struct vb_softc *vs, struct vb_if_attach *via)
 	struct ifnet *ifp;
 
 	if ((ifp = ifunit_ref(via->via_ifparent)) == NULL) {
-		printf("ifunit_ref failed\n");
+		printf("ifunit_ref failed for %s\n", via->via_ifparent);
 		return (ENXIO);
 	}
 
@@ -1969,7 +1974,7 @@ static device_method_t vb_if_methods[] = {
 };
 
 static driver_t vb_iflib_driver = {
-	"vmi", vb_if_methods, sizeof(struct vb_softc)
+	"vmnic", vb_if_methods, sizeof(struct vb_softc)
 };
 
 char vb_driver_version[] = "0.0.1";
@@ -2003,7 +2008,7 @@ static struct if_shared_ctx vb_sctx_init = {
 	.isc_ntxd_max = {VB_MAX_TXD},
 	.isc_nrxd_default = {VB_DEFAULT_RXD, VB_DEFAULT_RXD},
 	.isc_ntxd_default = {VB_DEFAULT_TXD},
-	.isc_name = "vmi",
+	.isc_name = "vmnic",
 	.isc_rx_completion = vb_rx_completion,
 };
 
