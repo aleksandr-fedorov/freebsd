@@ -359,8 +359,6 @@ vmm_init(void)
 
 	vmm_resume_p = vmm_resume;
 
-	vmm_vtnet_be_modinit();
-
 	return (VMM_INIT(vmm_ipinum));
 }
 
