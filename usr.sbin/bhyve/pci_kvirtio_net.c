@@ -298,8 +298,10 @@ vtnet_be_parseopts(struct vtnet_be_softc *vbs, char *opts)
 		}
 	}
 	if (vbs->vbs_vm_intf == NULL &&
-		vbs->vbs_hw_intf == NULL)
+		vbs->vbs_hw_intf == NULL) {
+		printf("interface argument required\n");
 		return (1);
+	}
 	return (vtnet_be_macaddr(vbs, mac));
 }
 
@@ -308,7 +310,7 @@ vtnet_be_clone(struct vtnet_be_softc *vbs)
 {
 	struct vb_vm_attach va;
 	struct ifreq ifr;
-	int i, s, flags, err;
+	int s, flags, err;
 #ifndef WITHOUT_CAPSICUM
 	cap_rights_t rights;
 	cap_ioctl_t vb_ioctls[] = { SIOCGPRIVATE_0 };
@@ -342,16 +344,13 @@ vtnet_be_clone(struct vtnet_be_softc *vbs)
 
 	strncpy(va.vva_ifparent, vbs->vbs_hw_intf, IFNAMSIZ-1);
 	memcpy(va.vva_macaddr, vbs->vbs_origmac, ETHER_ADDR_LEN);
-	for (i = 0; i < MAX_VMS; i++) {
-		sprintf(ifr.ifr_name, "vmi%d", i);
-		if (ioctl(s, SIOCIFCREATE2, &ifr) == 0) {
-			vbs->vbs_vm_intf = strdup(ifr.ifr_name);
-			break;
-		}
+	sprintf(ifr.ifr_name, "vmnic");
+	if (ioctl(s, SIOCIFCREATE2, &ifr) == 0) {
+		vbs->vbs_vm_intf = strdup(ifr.ifr_name);
+	} else {
+		perror("failed to create a vmnic");
+		return (errno);
 	}
-	if (i == MAX_VMS)
-		return (ENOSPC);
-
 	if (ioctl(s, SIOCGIFFLAGS, &ifr) < 0) {
 		perror("SIOCGIFFLAGS");
 		return (errno);
