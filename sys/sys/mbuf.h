@@ -366,7 +366,6 @@ typedef union {
  */
 void *mvec_seek(const struct mbuf *m, struct mvec_cursor *mc, int off);
 
-
 void *mvec_seek_pktno(const struct mbuf *m, struct mvec_cursor *mc, int off, uint16_t pktno);
 
 
