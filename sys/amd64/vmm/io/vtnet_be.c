@@ -1133,23 +1133,48 @@ vb_txflags(struct mbuf *m, struct pinfo *pinfo)
 }
 
 static void
-vb_input_process(struct ifnet *ifp, struct mbuf *m, int vni)
+vb_input_process(struct ifnet *ifp, struct mbuf **mp, int vni)
 {
 	struct pinfo pinfo;
 	caddr_t hdr;
-	
+	struct mbuf *mh, *mt, *m, *mnext;
+
+	m = *mp;
+	mh = mt = NULL;
 	do {
+		mnext = m->m_nextpkt;
+		m->m_nextpkt = NULL;
 		/* set mbuf flags for transmit */
 		ETHER_BPF_MTAP(ifp, m);
 		hdr = mtod(m, caddr_t);
 		vb_pparse(hdr, &pinfo);
-		vb_txflags(m, &pinfo);
-		if (vni) {
-			m->m_flags |= M_VXLANTAG;
-			m->m_pkthdr.vxlanid = vni;
+		switch (pinfo.etype) {
+			case ETHERTYPE_IP:
+			case ETHERTYPE_IPV6:
+			case ETHERTYPE_ARP:
+				/* pass */
+				if (mh == NULL)
+					mh = mt = m;
+				else {
+					mt->m_nextpkt = m;
+					mt = m;
+				}
+				vb_txflags(m, &pinfo);
+				if (vni) {
+					m->m_flags |= M_VXLANTAG;
+					m->m_pkthdr.vxlanid = vni;
+				}
+				break;
+			default:
+				m_freem(m);
+				goto next;
+				break;
 		}
-		m = m->m_nextpkt;
+	next:
+		m = mnext;
 	} while (m != NULL);
+
+	*mp = mh;
 }
 
 /*
@@ -1164,11 +1189,12 @@ vb_if_input(struct ifnet *vbifp, struct mbuf *m)
 	int vni;
 
 	vni = (vs->vs_flags & VS_VXLANTAG) ? vs->vs_vni : 0;
-	vb_input_process(vbifp, m, vni);
+	vb_input_process(vbifp, &m, vni);
 	/*
 	 * XXX check mbuf_to_qid
 	 */
-	(void)hwifp->if_transmit_txq(hwifp, m);
+	if (__predict_true(m != NULL))
+		(void)hwifp->if_transmit_txq(hwifp, m);
 }
 
 /*
@@ -1184,8 +1210,9 @@ vb_hw_if_input(struct ifnet *hwifp, struct mbuf *m)
 	vs = hwifp->if_pspare[3];
 	vbifp = iflib_get_ifp(vs->vs_ctx);
 
-	vb_input_process(hwifp, m, 0);
-	(void)vbifp->if_transmit(vbifp, m);
+	vb_input_process(hwifp, &m, 0);
+	if (__predict_true(m != NULL))
+		(void)vbifp->if_transmit(vbifp, m);
 }
 
 static void
