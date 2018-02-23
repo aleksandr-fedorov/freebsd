@@ -3811,6 +3811,10 @@ iflib_encap_one(iflib_txq_t txq, bus_dma_tag_t desc_tag, bus_dmamap_t map, struc
 	} else if (!m_ismvec(m_head) && __predict_false(err == EFBIG)) {
 		*m_headp = iflib_remove_mbuf(txq, txq->ift_pidx);
 		txq->ift_txd_encap_efbig++;
+		if (ctx->ifc_sctx->isc_flags & IFLIB_VIRTUAL) {
+			m_freem(*m_headp);
+			return (EFBIG);
+		}
 		if ((*m_headp = m_defrag(*m_headp, M_NOWAIT)) != NULL)
 			return (EFBIG);
 	} else
