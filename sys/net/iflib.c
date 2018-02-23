@@ -3809,17 +3809,15 @@ iflib_encap_one(iflib_txq_t txq, bus_dma_tag_t desc_tag, bus_dmamap_t map, struc
 		txq->ift_pidx = pi.ipi_new_pidx;
 		txq->ift_npending += pi.ipi_ndescs;
 	} else if (!m_ismvec(m_head) && __predict_false(err == EFBIG)) {
-		if (ctx->ifc_sctx->isc_flags & IFLIB_VIRTUAL) {
-			m_freem(*m_headp);
-			return (EFBIG);
-		}
 		*m_headp = iflib_remove_mbuf(txq, txq->ift_pidx);
 		txq->ift_txd_encap_efbig++;
 		if ((*m_headp = m_defrag(*m_headp, M_NOWAIT)) != NULL)
 			return (EFBIG);
-	} else
+	} else {
 		DBG_COUNTER_INC(encap_txd_encap_fail);
-	return (0);
+		m_freem(m_head);
+	}
+	return (err);
 }
 
 static int
