@@ -341,7 +341,7 @@ m_pkthdr_init(struct mbuf *m, int how)
 	int error;
 #endif
 	m->m_data = m->m_pktdat;
-	bzero(&m->m_pkthdr, sizeof(m->m_pkthdr) + sizeof(m->m_ext));
+	bzero(&m->m_pkthdr, sizeof(m->m_pkthdr));
 #ifdef MAC
 	/* If the label init fails, fail the alloc */
 	error = mac_mbuf_init(m, how);
