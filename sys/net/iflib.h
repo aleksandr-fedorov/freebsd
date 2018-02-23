@@ -333,10 +333,6 @@ typedef enum {
  */
 #define IFLIB_NEED_ZERO_CSUM	0x80
 /*
- * Driver needs frames padded to some minimum length
- */
-#define IFLIB_NEED_ETHER_PAD	0x100
-/*
  * Packets can be freed immediately after encap
  */
 #define IFLIB_TXD_ENCAP_PIO	0x0100
@@ -361,6 +357,14 @@ typedef enum {
  * No DMA support needed / wanted
  */
 #define IFLIB_VIRTUAL	0x2000
+/*
+ * autogenerate a MAC address
+ */
+#define IFLIB_GEN_MAC	0x4000
+/*
+ * Driver needs frames padded to some minimum length
+ */
+#define IFLIB_NEED_ETHER_PAD	0x8000
 
 /*
  * field accessors
