@@ -402,6 +402,7 @@ vb_txd_encap(void *arg, if_pkt_info_t pi)
 	if ((pi->ipi_len > vs->vs_cfg.mtu) && (pi->ipi_ipproto == IPPROTO_TCP)) {
 		vhd->hdr.gso_size = vs->vs_cfg.mtu - pi->ipi_ehdrlen - pi->ipi_ip_hlen -
 			max(sizeof(struct tcphdr), pi->ipi_tcp_hlen);
+		vhd->hdr.gso_size = min(vhd->hdr.gso_size, pi->ipi_len / vhd->num_buffers);
 		if (pi->ipi_etype == ETHERTYPE_IP)
 			vhd->hdr.gso_type = VIRTIO_NET_HDR_GSO_TCPV4;
 		else if (pi->ipi_etype == ETHERTYPE_IPV6)
