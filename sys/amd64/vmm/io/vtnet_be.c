@@ -692,11 +692,13 @@ vb_rx_vhdr_process(struct virtio_net_hdr_mrg_rxbuf *vh,
 
 	switch (vh->hdr.gso_type) {
 		case VIRTIO_NET_HDR_GSO_TCPV4:
+			ri->iri_tso_segsz = vh->hdr.gso_size;
 			ri->iri_csum_data = vh->hdr.csum_offset;
 			ri->iri_csum_flags = CSUM_TSO | CSUM_TCP;
 			return;
 			break;
 		case VIRTIO_NET_HDR_GSO_TCPV6:
+			ri->iri_tso_segsz = vh->hdr.gso_size;
 			ri->iri_csum_data = vh->hdr.csum_offset;
 			ri->iri_csum_flags = CSUM_IP6_TSO | CSUM_TCP_IPV6;
 			return;
@@ -1160,6 +1162,7 @@ vb_intr_msix(struct vb_softc *vs, int q)
 static void
 vb_txflags(struct mbuf *m, struct pinfo *pinfo)
 {
+	m->m_pkthdr.tso_segsz = m->m_pkthdr.fibnum;
 	m->m_pkthdr.l2hlen = pinfo->ehdrlen;
 	m->m_pkthdr.l3hlen = pinfo->l3size;
 	m->m_pkthdr.l4hlen = pinfo->l4size;

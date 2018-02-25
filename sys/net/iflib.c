@@ -2572,15 +2572,19 @@ iflib_check_rx_notify(iflib_rxq_t rxq, if_rxd_info_t ri, struct mbuf *m, int rxm
 {
 	if_ctx_t ctx = rxq->ifr_ctx;
 	struct mbuf *mnext;
+	uint16_t segsz;
 	void *arg1;
 	void *arg2;
 
 	arg1 = (void *)(uintptr_t)ri->iri_cookie1;
 	arg2 = (void *)(uintptr_t)ri->iri_cookie2;
+	segsz = ri->iri_tso_segsz;
 	ri->iri_cookie1 = NULL;
 	ri->iri_cookie2 = 0;
 	ri->iri_flowid = ri->iri_qsidx;
 
+	/* UGH */
+	m->m_pkthdr.fibnum = segsz;
 	MPASS(ctx->ifc_sctx->isc_rx_completion != NULL);
 	if (rxmvec_enable) {
 		m->m_ext.ext_arg1 = arg1;
