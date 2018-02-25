@@ -97,7 +97,6 @@ typedef struct if_rxd_info {
 	uint8_t	 iri_pad;		/* any padding in the received data */
 } *if_rxd_info_t;
 
-#define iri_tso_segsz iri_qsidx
 #define iri_cookie1 iri_ifp
 #define iri_cookie2 iri_flowid
 
